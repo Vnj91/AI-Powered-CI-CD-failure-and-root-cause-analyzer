@@ -12,3 +12,8 @@ tavily-python
 langchain-community
 langgraph
 streamlit
+pandas
+numpy
+scikit-learn
+joblib
+pytest

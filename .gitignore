@@ -2,6 +2,9 @@
 .env
 __pycache__/
 *.pyc
+data/*.csv
+models/*.joblib
+models/*.json
 # output/*.txt
 # output/*.log
 .ci-cd-env/

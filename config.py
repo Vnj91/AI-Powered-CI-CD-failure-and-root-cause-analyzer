@@ -22,8 +22,18 @@ class Config:
     # Directories
     PROJECT_ROOT = Path(__file__).parent
     SRC_DIR = PROJECT_ROOT / "src"
+    DATA_DIR = PROJECT_ROOT / "data"
+    MODELS_DIR = PROJECT_ROOT / "models"
     OUTPUT_DIR = PROJECT_ROOT / "output"
     TESTS_DIR = PROJECT_ROOT / "tests"
+
+    # Prediction Artifacts
+    HISTORICAL_DATASET_PATH = DATA_DIR / "historical_runs.csv"
+    PREDICTION_HISTORY_PATH = DATA_DIR / "prediction_history.csv"
+    PREDICTOR_MODEL_PATH = MODELS_DIR / "failure_predictor.joblib"
+    PREDICTOR_METADATA_PATH = MODELS_DIR / "failure_predictor_metadata.json"
+    CATEGORY_MODEL_PATH = MODELS_DIR / "failure_category_predictor.joblib"
+    CATEGORY_METADATA_PATH = MODELS_DIR / "failure_category_predictor_metadata.json"
     
     # AWS Configuration
     AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
@@ -77,7 +87,7 @@ class Config:
     @classmethod
     def ensure_directories(cls):
         """Ensure all required directories exist."""
-        for dir_path in [cls.OUTPUT_DIR, cls.TESTS_DIR]:
+        for dir_path in [cls.DATA_DIR, cls.MODELS_DIR, cls.OUTPUT_DIR, cls.TESTS_DIR]:
             dir_path.mkdir(parents=True, exist_ok=True)
 
 
@@ -91,3 +101,5 @@ if not validation["valid"]:
     for issue in validation["issues"]:
         print(f"  - {issue}")
     print("Please check your .env file")
+
+config.ensure_directories()
