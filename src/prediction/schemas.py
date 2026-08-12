@@ -103,4 +103,6 @@ class PredictionHistoryRecord(BaseModel):
     predicted_category: Optional[str] = None
     actual_failure: Optional[int] = None
     actual_category: Optional[str] = None
+    actual_conclusion: Optional[str] = None
+    feedback_recorded_at: Optional[datetime] = None
     model_version: Optional[str] = None

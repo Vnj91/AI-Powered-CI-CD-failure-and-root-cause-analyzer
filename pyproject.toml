@@ -1,0 +1,32 @@
+[project]
+name = "cicd-root-cause-analyzer"
+version = "1.0.0"
+requires-python = ">=3.11"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+exclude = [
+    ".venv",
+    "__pycache__",
+    ".git",
+    "data",
+    "models",
+    "output",
+]
+
+[tool.ruff.lint]
+# Catch syntax errors and obvious bugs without forcing a full style rewrite.
+select = ["E", "F"]
+ignore = [
+    "E501",  # line too long in legacy modules
+    "F401",  # unused imports in agent/tool modules
+    "F541",  # f-string without placeholders
+    "F841",  # unused local variables in exploratory code
+    "F811",  # duplicate definitions in legacy research_agent.py
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"

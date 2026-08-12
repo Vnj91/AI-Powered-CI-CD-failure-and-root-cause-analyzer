@@ -1,0 +1,76 @@
+# DEVELOPMENT / TESTING ONLY
+# Manual workflow to generate REAL failed GitHub Actions runs for ML dataset building.
+# Does NOT run on push or pull_request. Does NOT modify historical_runs.csv directly.
+# After a run fails here, recollect history with:
+#   python3 -m src.prediction.cli collect owner/repo --output data/historical_runs.csv
+
+name: Controlled CI Failure Generator (Dev/Testing Only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      failure_type:
+        description: "Which CI category to fail intentionally"
+        required: true
+        type: choice
+        options:
+          - lint
+          - test
+          - build
+          - dependency
+          - docker
+
+permissions:
+  contents: read
+
+concurrency:
+  group: controlled-failure-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  controlled-failure:
+    name: "Controlled failure (${{ inputs.failure_type }})"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Controlled lint failure
+        if: inputs.failure_type == 'lint'
+        run: |
+          echo "Intentional lint/static-analysis failure for dataset generation."
+          printf 'def broken_syntax(\n' > /tmp/controlled_lint_failure.py
+          python3 -m compileall -q /tmp/controlled_lint_failure.py
+
+      - name: Controlled test failure
+        if: inputs.failure_type == 'test'
+        run: |
+          echo "Intentional unit-test failure for dataset generation."
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+          pytest -q -k "controlled_failure_generator_nonexistent_test"
+
+      - name: Controlled build failure
+        if: inputs.failure_type == 'build'
+        run: |
+          echo "Intentional build/import failure for dataset generation."
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python3 -c "import this_module_does_not_exist_for_controlled_build_failure"
+
+      - name: Controlled dependency failure
+        if: inputs.failure_type == 'dependency'
+        run: |
+          echo "Intentional dependency installation failure for dataset generation."
+          python -m pip install --upgrade pip
+          pip install totally-nonexistent-package-controlled-failure-xyz
+
+      - name: Controlled docker failure
+        if: inputs.failure_type == 'docker'
+        run: |
+          echo "Intentional Docker build failure for dataset generation."
+          docker build -f Dockerfile.controlled-failure-nonexistent .
+
+      - name: Success marker (only if no failure step ran)
+        if: false
+        run: echo "This job should always fail via one of the controlled steps above."

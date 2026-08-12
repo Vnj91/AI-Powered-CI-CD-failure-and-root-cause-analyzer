@@ -9,3 +9,6 @@ models/*.json
 # output/*.log
 .ci-cd-env/
 ci-cd-env/
+.coverage
+coverage.xml
+htmlcov/

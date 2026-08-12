@@ -18,6 +18,7 @@ from github.WorkflowRun import WorkflowRun
 
 from ..constants import GITHUB_ACCESS_TOKEN
 from ..tools.log_parser import parse_log_content
+from .category_mapper import map_failure_category
 from .feature_extractor import FailureFeatureExtractor
 from .schemas import WorkflowRunRecord
 
@@ -212,7 +213,13 @@ class HistoricalRunCollector:
 
             parsed = parse_log_content("\n".join(combined_logs))
             if parsed.primary_error and parsed.primary_error.error_category:
-                return parsed.primary_error.error_category.value
+                mapped = map_failure_category(
+                    log_parser_category=parsed.primary_error.error_category.value,
+                    error_type=parsed.primary_error.error_type,
+                    error_message=parsed.primary_error.error_message,
+                    failed_step=parsed.primary_error.failed_step,
+                )
+                return mapped.value
         except Exception:
             return None
 

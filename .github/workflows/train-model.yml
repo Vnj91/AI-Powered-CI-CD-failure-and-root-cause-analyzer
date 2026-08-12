@@ -1,0 +1,92 @@
+name: Train Failure Predictor
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "owner/repo to collect workflow history from (defaults to this repo)"
+        required: false
+        type: string
+  schedule:
+    # Weekly retrain — avoids burning minutes on every PR
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: train-model-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  train:
+    name: Collect, Train, Evaluate, Publish Model
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Collect historical workflow runs
+        env:
+          GITHUB_ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.event.inputs.repository }}"
+          if [ -z "$REPO" ]; then
+            REPO="${{ github.repository }}"
+          fi
+          mkdir -p data models
+          python3 -m src.prediction.cli collect "$REPO" --output data/historical_runs.csv
+
+      - name: Inspect dataset
+        run: python3 -m src.prediction.cli inspect --dataset data/historical_runs.csv
+
+      - name: Train model (skip if insufficient real data)
+        id: train
+        run: |
+          set +e
+          python3 -m src.prediction.cli train \
+            --dataset data/historical_runs.csv \
+            --model models/failure_predictor.joblib
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Evaluate model
+        if: steps.train.outputs.exit_code == '0' && hashFiles('models/failure_predictor.joblib') != ''
+        run: |
+          python3 -m src.prediction.cli evaluate \
+            --dataset data/historical_runs.csv \
+            --model models/failure_predictor.joblib
+
+      - name: Upload trained model artifact
+        if: hashFiles('models/failure_predictor.joblib') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-predictor-model
+          path: |
+            models/failure_predictor.joblib
+            models/failure_predictor_metadata.json
+            models/failure_category_predictor.joblib
+            models/failure_category_predictor_metadata.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Report training skipped
+        if: hashFiles('models/failure_predictor.joblib') == ''
+        run: |
+          echo "No model artifact produced — insufficient real historical data or training refused."
+          echo "Collect more CI history on this repository and re-run this workflow."

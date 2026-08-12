@@ -1,0 +1,111 @@
+name: Pre-CI Failure Prediction
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  predict:
+    name: Pre-CI Failure Prediction
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download latest trained model artifact
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: train-model.yml
+          name: failure-predictor-model
+          path: models/
+          if_no_artifact_found: warn
+
+      - name: Run pre-CI failure prediction
+        env:
+          GITHUB_ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+
+          from config import Config
+          from src.prediction.data_collector import HistoricalRunCollector
+          from src.prediction.feature_extractor import FailureFeatureExtractor
+          from src.prediction.predictor import FailurePredictor
+
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          sha = os.environ.get("GITHUB_SHA", "")
+          ref = os.environ.get("GITHUB_REF", "")
+          branch = ref.split("/")[-1] if ref else "main"
+          model_path = Config.PREDICTOR_MODEL_PATH
+
+          print("CI Failure Prediction")
+          print("---------------------")
+
+          if not repo or not sha:
+              print("Prediction skipped — missing repository context.")
+              sys.exit(0)
+
+          if not model_path.exists():
+              print("Prediction model unavailable — skipping prediction.")
+              print("Run the 'Train Failure Predictor' workflow to publish a model artifact.")
+              sys.exit(0)
+
+          if not os.environ.get("GITHUB_ACCESS_TOKEN"):
+              print("Prediction model unavailable — GITHUB_ACCESS_TOKEN not configured.")
+              sys.exit(0)
+
+          collector = HistoricalRunCollector()
+          features = collector.build_prediction_features(
+              repository=repo,
+              commit_sha=sha,
+              branch=branch,
+          )
+          feature_row = FailureFeatureExtractor.to_feature_row(features)
+          prediction = FailurePredictor(
+              model_path,
+              category_model_path=Config.CATEGORY_MODEL_PATH,
+          ).predict(feature_row)
+
+          if not prediction.model_available:
+              print("Prediction model unavailable — skipping prediction.")
+              sys.exit(0)
+
+          probability = prediction.failure_probability or 0.0
+          outcome = "FAILURE" if prediction.predicted_failure else "SUCCESS"
+          print(f"Probability: {probability:.0%}")
+          print(f"Risk: {prediction.risk_level}")
+          print(f"Predicted outcome: {outcome}")
+          if prediction.predicted_category:
+              suffix = (
+                  f" ({prediction.category_confidence:.0%})"
+                  if prediction.category_confidence is not None
+                  else ""
+              )
+              print(f"Predicted category: {prediction.predicted_category}{suffix}")
+          if prediction.top_risk_factors:
+              print("Risk factors associated with this prediction:")
+              for factor in prediction.top_risk_factors[:5]:
+                  print(f"- {factor.feature}: value={factor.value:.2f}, importance={factor.importance:.4f}")
+          PY

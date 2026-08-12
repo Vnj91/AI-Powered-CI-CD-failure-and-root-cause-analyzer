@@ -106,7 +106,12 @@ class DebuggingBrief(BaseModel):
         ge=0.0, le=1.0,
         description="Overall confidence in the analysis"
     )
-    analysis_duration_seconds: Optional[float] = Field(default=None)
+    analysis_duration_seconds: Optional[float] = None
+
+    likely_culprit_sha: Optional[str] = Field(default=None, description="Most likely culprit commit SHA")
+    likely_culprit_message: Optional[str] = Field(default=None, description="Culprit commit message")
+    likely_culprit_confidence: Optional[str] = Field(default=None, description="Culprit confidence label")
+    likely_culprit_evidence: list[str] = Field(default_factory=list, description="Deterministic culprit evidence")
     
     def to_markdown(self) -> str:
         """
@@ -151,6 +156,20 @@ class DebuggingBrief(BaseModel):
             md.append("### Affected Files")
             for f in self.affected_files[:5]:
                 md.append(f"- `{f}`")
+            md.append("")
+
+        if self.likely_culprit_sha:
+            md.append("## 🔍 Most Likely Culprit (Evidence-Based)\n")
+            md.append("_Highest-scoring change based on available evidence — not definitive proof of causality._\n")
+            md.append(f"**Commit:** `{self.likely_culprit_sha[:7]}`")
+            if self.likely_culprit_message:
+                md.append(f"\n**Message:** {self.likely_culprit_message}")
+            if self.likely_culprit_confidence:
+                md.append(f"\n**Confidence:** {self.likely_culprit_confidence}")
+            if self.likely_culprit_evidence:
+                md.append("\n**Evidence:**")
+                for item in self.likely_culprit_evidence:
+                    md.append(f"- {item}")
             md.append("")
         
         # Fix Suggestions (THE MAIN VALUE)

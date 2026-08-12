@@ -3,25 +3,28 @@ app.py - Simple Web Dashboard for CI/CD Analyzer
 Run: streamlit run app.py
 """
 
-import streamlit as st
-from pathlib import Path
 import sys
+from pathlib import Path
+
+import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.graph.workflow import run_analysis
-from src.graph.state import GraphState
-from src.prediction import FailurePredictionService, HistoricalRunCollector
 from config import Config
+from src.graph.workflow import run_analysis
+from src.prediction import FailurePredictionService, HistoricalRunCollector
+from src.prediction.feedback import PredictionFeedbackService
+from src.prediction.history_store import PredictionHistoryStore
+
 
 st.set_page_config(
     page_title="CI/CD Root Cause Analyzer",
     page_icon="🔧",
-    layout="wide"
+    layout="wide",
 )
 
 st.title("CI/CD Root Cause Analyzer")
-st.markdown("Analyze failed GitHub Actions builds using AI agents")
+st.markdown("Predict CI/CD failure risk before runs complete, then analyze failures with AI agents.")
 
 
 @st.cache_resource
@@ -35,9 +38,12 @@ def get_prediction_service() -> FailurePredictionService:
     )
 
 
-@st.cache_resource
-def get_history_collector() -> HistoricalRunCollector:
-    return HistoricalRunCollector()
+def get_history_collector() -> HistoricalRunCollector | None:
+    try:
+        return HistoricalRunCollector()
+    except ValueError as exc:
+        st.warning(str(exc))
+        return None
 
 
 def render_prediction(prediction):
@@ -66,7 +72,8 @@ def render_prediction(prediction):
         st.write(f"**Predicted Category:** {prediction.predicted_category}{category_suffix}")
 
     if prediction.top_risk_factors:
-        st.markdown("**Top Risk Factors**")
+        st.markdown("**Risk factors associated with this prediction**")
+        st.caption("Model signals — correlation, not proven causality.")
         for factor in prediction.top_risk_factors:
             st.markdown(f"- {factor.feature}: value={factor.value:.2f}, importance={factor.importance:.4f}")
 
@@ -75,6 +82,56 @@ def render_prediction(prediction):
             st.markdown(
                 f"- {factor.feature}: value={factor.value:.2f}, importance={factor.importance:.4f}, contribution={factor.contribution:.4f}"
             )
+
+
+def render_culprit(brief):
+    if not brief.likely_culprit_sha:
+        return
+    st.subheader("Most Likely Culprit (evidence-based)")
+    st.caption("Highest-scoring change based on available evidence — not definitive proof of causality.")
+    st.code(brief.likely_culprit_sha[:12])
+    if brief.likely_culprit_message:
+        st.write(brief.likely_culprit_message)
+    if brief.likely_culprit_confidence:
+        st.write(f"**Confidence:** {brief.likely_culprit_confidence.title()}")
+    if brief.likely_culprit_evidence:
+        st.markdown("**Evidence**")
+        for item in brief.likely_culprit_evidence:
+            st.markdown(f"- {item}")
+
+
+def render_feedback_summary():
+    store = PredictionHistoryStore(Config.PREDICTION_HISTORY_PATH)
+    feedback = PredictionFeedbackService(store)
+    summary = feedback.feedback_accuracy_summary()
+    recent = store.recent_feedback_summary(limit=5)
+
+    st.subheader("Prediction Feedback")
+    if summary["recorded"] == 0:
+        st.info("No recorded prediction outcomes yet.")
+        return
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Recorded Outcomes", summary["recorded"])
+    col2.metric("Correct Predictions", summary["correct"])
+    col3.metric("Feedback Accuracy", f"{summary['accuracy']:.0%}" if summary["accuracy"] is not None else "N/A")
+
+    if not recent.empty:
+        display = recent[
+            [
+                col
+                for col in [
+                    "timestamp",
+                    "commit_sha",
+                    "predicted_failure",
+                    "actual_failure",
+                    "actual_conclusion",
+                    "prediction_correct",
+                ]
+                if col in recent.columns
+            ]
+        ]
+        st.dataframe(display, use_container_width=True)
 
 
 def build_prediction_inputs(repo_name: str, branch: str | None, commit_sha: str | None, workflow_name: str | None):
@@ -90,6 +147,8 @@ def build_prediction_inputs(repo_name: str, branch: str | None, commit_sha: str 
         workflow_name = workflow_name or getattr(getattr(latest_run, "workflow", None), "name", None) or getattr(latest_run, "name", None)
 
     collector = get_history_collector()
+    if collector is None:
+        raise ValueError("GitHub credentials are required for prediction feature collection.")
     features = collector.build_prediction_features(
         repository=repo_name,
         commit_sha=commit_sha,
@@ -98,14 +157,15 @@ def build_prediction_inputs(repo_name: str, branch: str | None, commit_sha: str 
     )
     return features
 
+
 repo_name = st.text_input(
     "GitHub Repository",
     placeholder="owner/repo",
-    value="Yasshu55/Test-repo"
+    value=Config.DEFAULT_TEST_REPO,
 )
 
 with st.expander("Failure Risk Prediction", expanded=True):
-    st.caption("Provide a commit SHA and branch for a true pre-run prediction. If omitted, the app will use the latest workflow run as a proxy input.")
+    st.caption("Provide a commit SHA and branch for a true pre-run prediction. If omitted, the app uses the latest workflow run as a proxy input.")
     branch_name = st.text_input("Branch", placeholder="main")
     commit_sha = st.text_input("Commit SHA", placeholder="Optional for latest run fallback")
     workflow_name = st.text_input("Workflow Name", placeholder="Optional")
@@ -129,6 +189,7 @@ with st.expander("Failure Risk Prediction", expanded=True):
                 except Exception as e:
                     st.error(f"Prediction error: {e}")
 
+render_feedback_summary()
 st.divider()
 
 if st.button("Analyze Latest Failed Run", type="secondary"):
@@ -149,11 +210,17 @@ if st.button("Analyze Latest Failed Run", type="secondary"):
                     col2.metric("Confidence", f"{brief.confidence_score:.0%}")
                     col3.metric("Fixes Found", len(brief.fix_suggestions))
 
+                    st.subheader("Failure Category")
+                    st.write(brief.error_category)
+
                     st.subheader("Error")
                     st.code(f"{brief.error_type}: {brief.error_message}")
 
                     st.subheader("Root Cause")
                     st.write(brief.root_cause_summary)
+                    st.caption("LLM RCA reasoning — separate from ML model signals above.")
+
+                    render_culprit(brief)
 
                     st.subheader("Fix Suggestions")
                     for fix in brief.fix_suggestions:
@@ -175,7 +242,7 @@ if st.button("Analyze Latest Failed Run", type="secondary"):
                         "Download Report (Markdown)",
                         brief.to_markdown(),
                         file_name="debugging_brief.md",
-                        mime="text/markdown"
+                        mime="text/markdown",
                     )
 
                     try:
@@ -185,22 +252,27 @@ if st.button("Analyze Latest Failed Run", type="secondary"):
                         if latest_run:
                             service = get_prediction_service()
                             collector = get_history_collector()
-                            latest_run_features = collector.build_prediction_features(
-                                repository=repo_name,
-                                commit_sha=latest_run.head_sha,
-                                branch=getattr(latest_run, "head_branch", None),
-                                workflow_name=getattr(getattr(latest_run, "workflow", None), "name", None) or getattr(latest_run, "name", None),
-                            )
-                            prediction, _ = service.predict_and_record(
-                                repository=latest_run_features["repository"],
-                                workflow=latest_run_features.get("workflow_name"),
-                                run_id=latest_run_features.get("run_id"),
-                                commit_sha=latest_run_features.get("commit_sha"),
-                                features=latest_run_features,
-                                actual_failure=1,
-                                actual_category=brief.error_category,
-                            )
-                            render_prediction(prediction)
+                            if collector:
+                                latest_run_features = collector.build_prediction_features(
+                                    repository=repo_name,
+                                    commit_sha=latest_run.head_sha,
+                                    branch=getattr(latest_run, "head_branch", None),
+                                    workflow_name=getattr(getattr(latest_run, "workflow", None), "name", None) or getattr(latest_run, "name", None),
+                                )
+                                prediction, _ = service.predict_and_record(
+                                    repository=latest_run_features["repository"],
+                                    workflow=latest_run_features.get("workflow_name"),
+                                    run_id=latest_run.id,
+                                    commit_sha=latest_run_features.get("commit_sha"),
+                                    features=latest_run_features,
+                                )
+                                render_prediction(prediction)
+                                service.record_workflow_outcome(
+                                    repository=repo_name,
+                                    run=latest_run,
+                                    actual_category=brief.error_category,
+                                )
+                                render_feedback_summary()
                     except Exception:
                         pass
                 else:
@@ -213,19 +285,17 @@ if st.button("Analyze Latest Failed Run", type="secondary"):
 
 with st.sidebar:
     st.header("About")
-    st.markdown("""
-    This tool uses AI agents to:
-    1. Fetch failed build logs
-    2. Parse and extract errors
-    3. Analyze root cause
-    4. Research solutions
-    5. Generate fix suggestions
-    6. Predict CI/CD failure risk before the run completes
-    
+    st.markdown(
+        """
+    **Prediction (ML):** failure probability, risk level, feature importance
+
+    **RCA (LLM):** log understanding, root cause, fixes, culprit commit evidence
+
     **Tech Stack:**
-    - LangGraph (Supervisor Pattern)
-    - Claude 3.5 Sonnet
+    - LangGraph supervisor workflow
+    - Claude via AWS Bedrock
     - Tavily Search
     - PyGithub
-    - Scikit-learn
-    """)
+    - Scikit-learn Random Forest
+    """
+    )

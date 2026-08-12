@@ -20,6 +20,8 @@ from src.graph.state import (
 )
 from src.tools.github_loader import fetch_failed_build_logs
 from src.tools.log_parser import parse_log_file
+from src.tools.commit_analyzer import analyze_culprit_for_repository
+from src.prediction.category_mapper import map_failure_category
 from src.agents.triage_agent import TriageAgent
 from src.agents.research_agent import ResearchAgent
 from src.agents.synthesis_agent import SynthesisAgent
@@ -189,6 +191,28 @@ def synthesize_node(state: GraphState) -> dict:
             state.research_result,
             state.repo_name
         )
+
+        mapped_category = map_failure_category(
+            log_parser_category=state.primary_error.error_category.value if state.primary_error else None,
+            triage_category=state.triage_result.error_category_refined.value if state.triage_result else None,
+            failed_step=state.primary_error.failed_step if state.primary_error else None,
+            error_type=state.primary_error.error_type if state.primary_error else None,
+            error_message=state.primary_error.error_message if state.primary_error else None,
+        )
+        brief.error_category = mapped_category.value
+
+        culprit = analyze_culprit_for_repository(
+            repo_name=state.repo_name,
+            parsed_error=state.primary_error,
+            error_category=mapped_category.value,
+            failed_step=state.primary_error.failed_step if state.primary_error else None,
+        )
+        if culprit.commit_sha:
+            brief.likely_culprit_sha = culprit.commit_sha
+            brief.likely_culprit_message = culprit.commit_message
+            brief.likely_culprit_confidence = culprit.confidence
+            brief.likely_culprit_evidence = culprit.evidence
+
         failure_counts["synthesize"] = 0
         
         return {

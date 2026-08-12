@@ -18,28 +18,78 @@ The RCA pipeline is unchanged in spirit: GitHub Actions logs are fetched, parsed
 
 ## Architecture
 
-### Existing RCA flow
+```
+Developer
+    ↓
+Commit / PR
+    ↓
+Pre-CI Prediction (.github/workflows/predict.yml + CLI/UI)
+    ↓
+GitHub Actions CI (.github/workflows/ci.yml)
+    ├── Lint
+    ├── Unit Tests
+    ├── Prediction Tests
+    ├── Security
+    ├── Build
+    └── Docker
+    ↓
+Workflow Result
+    ↓
+Prediction Feedback (prediction_history.csv)
+    ↓
+If failure → RCA (LangGraph)
+    ├── Triage (LLM)
+    ├── Research (LLM + Tavily)
+    ├── Root Cause + Fixes (LLM)
+    └── Likely Culprit Commit (deterministic)
+    ↓
+Historical Dataset (data/historical_runs.csv)
+    ↓
+Future Model Training
+```
 
-GitHub Repository -> Failed GitHub Actions Run -> Fetch Logs -> Parse Error -> Triage -> Research -> Synthesis
+### ML prediction flow (before CI completes)
 
-### New prediction flow
+Historical GitHub Actions runs → feature extraction → Random Forest → failure probability + optional category + feature importance
 
-Historical GitHub Actions runs -> Feature extraction -> Random Forest model -> Failure probability + risk factors
+### RCA flow (after failure)
 
-### Combined flow
+GitHub Repository → failed run logs → parse/classify error → triage → research → synthesis → debugging brief + culprit commit evidence
 
-Commit / PR -> Prediction -> GitHub Actions -> If failed, RCA -> Fix suggestions
+### Combined product flow
 
-## New Modules
+Commit / PR → predict risk → CI runs → record actual outcome → if failed, run RCA → collect more labeled history → retrain
 
-- `src/prediction/data_collector.py`
-- `src/prediction/feature_extractor.py`
-- `src/prediction/trainer.py`
-- `src/prediction/predictor.py`
-- `src/prediction/evaluator.py`
-- `src/prediction/history_store.py`
-- `src/prediction/service.py`
+## Modules
+
+### Prediction layer
+- `src/prediction/data_collector.py` — historical run collection
+- `src/prediction/feature_extractor.py` — deterministic features
+- `src/prediction/category_mapper.py` — expanded failure category taxonomy
+- `src/prediction/dataset_validator.py` — dataset quality + leakage checks
+- `src/prediction/trainer.py` / `predictor.py` / `evaluator.py`
+- `src/prediction/history_store.py` / `feedback.py` / `service.py`
 - `src/prediction/cli.py`
+
+### RCA layer (unchanged core)
+- `src/graph/workflow.py` — LangGraph supervisor workflow
+- `src/agents/` — triage, research, synthesis
+- `src/tools/log_parser.py`, `src/tools/github_loader.py`
+- `src/tools/commit_analyzer.py` — likely culprit commit scoring
+
+## Data Safety / Leakage Prevention
+
+Target/metadata columns are **never** model input features:
+
+- `actual_failure`, `actual_category`, `status`, `conclusion`, `duration_seconds`
+
+Historical features for a target run are computed only from **prior** completed runs. The target run itself is excluded from its own history window. Pre-CI prediction uses commit metadata + prior run history only — never the target run's final conclusion.
+
+Inspect any dataset before training:
+
+```bash
+python3 -m src.prediction.cli inspect --dataset data/historical_runs.csv
+```
 
 ## Tech Stack
 
@@ -67,15 +117,103 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Building a Real Historical CI Dataset
+
+This project learns from **genuine GitHub Actions workflow runs**. Do not fabricate CSV rows or synthetic labels.
+
+### Step 1 — Generate successful CI history
+
+Every normal commit/PR to `main` runs `.github/workflows/ci.yml` and creates real successful runs when CI passes:
+
+```bash
+git checkout -b feature/my-change
+# make a small legitimate change, commit, push
+git push -u origin feature/my-change
+# open a PR to main → CI runs on pull_request
+# merge to main → CI runs again on push
+```
+
+You can also trigger CI manually: **Actions → CI/CD Pipeline → Run workflow**.
+
+Each completed workflow run is later visible to the collector.
+
+### Step 2 — Generate a small number of legitimate failures (dev/testing only)
+
+Use the manual utility workflow — it does **not** run automatically:
+
+**Actions → Controlled CI Failure Generator (Dev/Testing Only) → Run workflow**
+
+Choose a `failure_type`:
+
+| Input | What fails | Typical category |
+|-------|------------|------------------|
+| `lint` | Syntax/compile check | lint |
+| `test` | pytest selection | test |
+| `build` | Import/build step | build |
+| `dependency` | pip install | dependency |
+| `docker` | Docker build | docker |
+
+This creates a **real failed GitHub Actions run**. It does not modify `historical_runs.csv` directly.
+
+Recommended pattern:
+
+```
+success → success → success → controlled failure → fix → success → ...
+```
+
+### Step 3 — Recollect history
+
+```bash
+export GITHUB_ACCESS_TOKEN=ghp_...
+python3 -m src.prediction.cli collect \
+  Vnj91/AI-Powered-CI-CD-failure-and-root-cause-analyzer \
+  --output data/historical_runs.csv
+python3 -m src.prediction.cli inspect --dataset data/historical_runs.csv
+```
+
+The collector gathers **all completed workflows** (CI, pre-CI prediction, controlled failures, etc.).
+
+### Step 4 — Train only when inspect says sufficient
+
+Requires **≥20 runs** and **both success and failure classes**. Training refuses one-class datasets.
+
+```bash
+python3 -m src.prediction.cli train --dataset data/historical_runs.csv
+python3 -m src.prediction.cli evaluate --dataset data/historical_runs.csv
+```
+
+### Step 5 — Publish model artifact (GitHub Actions)
+
+Run **Train Failure Predictor** workflow (`train-model.yml`) after enough real history exists.  
+`predict.yml` downloads the artifact for non-blocking pre-CI prediction.
+
+### Important
+
+- Do not insert fake rows into `data/historical_runs.csv`.
+- Real predictive quality depends on real, varied CI history.
+- The controlled failure workflow is for development/testing only.
+- Validation thresholds are intentional and are not weakened.
+
 ## Collect Historical Data
 
-Use the prediction CLI to collect workflow history into a CSV dataset.
+Requires `GITHUB_ACCESS_TOKEN` with access to the target repository.
 
 ```bash
 python3 -m src.prediction.cli collect owner/repo --output data/historical_runs.csv
+python3 -m src.prediction.cli inspect --dataset data/historical_runs.csv
 ```
 
-This dataset is one training example per workflow run.
+This creates one training example per workflow run from real GitHub Actions history.
+
+## Record Prediction Feedback
+
+After a CI run completes, close the loop manually if needed:
+
+```bash
+python3 -m src.prediction.cli feedback owner/repo COMMIT_SHA --conclusion success --run-id 123456
+```
+
+Supported conclusions: `success`, `failure`, `cancelled`, `skipped`, etc. Non-binary outcomes (e.g. `cancelled`) are recorded without treating them as success.
 
 ## Train the Failure Model
 
@@ -134,15 +272,95 @@ This is a baseline model, not a production-grade predictor. Expect noisy results
 
 Class imbalance is common, so precision, recall, and F1 matter more than raw accuracy.
 
+## Model Artifact Strategy
+
+Models are **not** committed to git (`models/*.joblib` is gitignored).
+
+| Workflow | Purpose |
+|----------|---------|
+| `.github/workflows/train-model.yml` | Manual (`workflow_dispatch`) or weekly schedule — collect real history, train, evaluate, upload artifact |
+| `.github/workflows/predict.yml` | Downloads latest `failure-predictor-model` artifact, runs pre-CI prediction (non-blocking) |
+| `.github/workflows/feedback.yml` | Records actual CI outcomes against pending predictions after workflows complete |
+
+Train a model in GitHub Actions:
+
+1. Actions → **Train Failure Predictor** → Run workflow
+2. After success, download artifact from that run or let `predict.yml` consume it automatically
+
+Local training still works:
+
+```bash
+python3 -m src.prediction.cli collect owner/repo --output data/historical_runs.csv
+python3 -m src.prediction.cli train --dataset data/historical_runs.csv
+```
+
+## Pre-CI Prediction in GitHub Actions
+
+Optional workflow: `.github/workflows/predict.yml`
+
+Runs on `pull_request` and `push` to `main`. It loads the trained model if present and prints failure probability **before** the main CI result is used. If no model exists, it skips gracefully and does not block CI.
+
 ## Limitations
 
-- Failure category prediction is intentionally optional and not forced if the training data is insufficient.
+- Failure category prediction is optional and requires enough real labeled failures.
 - Predictions depend on historical run metadata that may be incomplete in some repositories.
 - The model does not replace the existing LLM-based RCA path.
 - The app does not fabricate confidence where the model does not support it.
+- **Real GitHub credentials are required** to collect history and score live commits.
+- Baseline Random Forest quality depends on dataset size; below ~50 runs expect weak signal.
+- Culprit commit analysis uses deterministic evidence; it does not replace git bisect or human review.
 
 ## Notes
 
 The UI now shows a failure-risk section before the existing RCA output. If a failure has already happened, the RCA pipeline still runs exactly as before.
+
+## CI/CD Pipeline
+
+This repository uses a multi-stage GitHub Actions pipeline at [`.github/workflows/ci.yml`](.github/workflows/ci.yml). The stages are intentionally separated so historical workflow outcomes map to meaningful failure categories for the ML prediction layer.
+
+```
+Code Checkout
+    ↓
+Lint / Static Checks
+    ↓
+Unit Tests
+    ↓
+Prediction Module Tests
+    ↓
+Build / App Validation ──┐
+                         ├──→ Docker Build & Validate
+Security Check ──────────┘
+    ↓ (main branch pushes only)
+Release Artifact
+```
+
+| Job | Purpose | Typical failure category |
+|-----|---------|--------------------------|
+| `lint` | `ruff` + `compileall` | Code quality / syntax |
+| `unit-tests` | Full `pytest -q` suite with coverage | Test failure |
+| `prediction-tests` | ML import, feature extraction, train/load/predict/evaluate via test fixtures | ML / prediction failure |
+| `build` | Compile sources and import modules without live API credentials | Application / build failure |
+| `security` | `pip-audit` on installed dependencies | Dependency / security failure |
+| `docker-build` | Build image and verify Streamlit health endpoint | Container / build failure |
+| `release-artifact` | Package a deployment bundle on `main` (simulated release, no cloud deploy) | Release packaging failure |
+
+The pipeline does **not** require AWS, Bedrock, Tavily, or GitHub tokens for ordinary CI runs. Tests use mocked fixtures already present in `tests/test_prediction.py`.
+
+Run CI-like checks locally:
+
+```bash
+python -m pip install -r requirements.txt pytest pytest-cov ruff pip-audit
+ruff check .
+python -m compileall -q .
+pytest -q
+pip-audit
+docker build -t cicd-root-cause-analyzer:test .
+docker run --rm -d -p 8501:8501 --name cicd-test cicd-root-cause-analyzer:test
+curl -f http://127.0.0.1:8501/_stcore/health
+docker stop cicd-test
+```
+
+To build historical CI/CD data for the failure predictor, run this workflow on real pull requests and merges to `main`. Do not fabricate workflow outcomes — introduce controlled, real failures by temporarily breaking the relevant stage (for example, a lint violation, a failing assertion, or an outdated dependency) and reverting after the run is recorded.
+
 
 
