@@ -45,17 +45,32 @@ class FailurePredictor:
             self.pipeline = None
             return False
 
-        self.artifact = joblib.load(self.model_path)
+        try:
+            self.artifact = joblib.load(self.model_path)
+        except Exception:
+            self.available = False
+            self.artifact = None
+            self.pipeline = None
+            self.category_available = False
+            self.category_pipeline = None
+            return False
+
         self.pipeline = self.artifact.get("pipeline")
         self.feature_columns = list(self.artifact.get("feature_columns", self.feature_columns))
         self.model_version = str(self.artifact.get("trained_at", "unknown"))
         self.available = self.pipeline is not None
 
         if self.category_model_path and self.category_model_path.exists():
-            self.category_artifact = joblib.load(self.category_model_path)
-            self.category_pipeline = self.category_artifact.get("pipeline")
-            self.category_model_version = str(self.category_artifact.get("trained_at", "unknown"))
-            self.category_available = self.category_pipeline is not None
+            try:
+                self.category_artifact = joblib.load(self.category_model_path)
+            except Exception:
+                self.category_artifact = None
+                self.category_pipeline = None
+                self.category_available = False
+            else:
+                self.category_pipeline = self.category_artifact.get("pipeline")
+                self.category_model_version = str(self.category_artifact.get("trained_at", "unknown"))
+                self.category_available = self.category_pipeline is not None
         else:
             self.category_artifact = None
             self.category_pipeline = None

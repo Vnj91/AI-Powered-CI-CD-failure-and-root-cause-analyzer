@@ -34,6 +34,10 @@ class Config:
     PREDICTOR_METADATA_PATH = MODELS_DIR / "failure_predictor_metadata.json"
     CATEGORY_MODEL_PATH = MODELS_DIR / "failure_category_predictor.joblib"
     CATEGORY_METADATA_PATH = MODELS_DIR / "failure_category_predictor_metadata.json"
+
+    # GitHub Actions artifact names (must match workflow upload/download steps)
+    MODEL_ARTIFACT_NAME = "failure-predictor-model"
+    PREDICTION_HISTORY_ARTIFACT_NAME = "prediction-history"
     
     # AWS Configuration
     AWS_REGION = os.getenv("AWS_REGION", "us-east-1")

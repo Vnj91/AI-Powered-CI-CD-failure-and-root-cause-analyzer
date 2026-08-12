@@ -33,6 +33,13 @@ def test_category_mapper_maps_docker_keywords():
     assert category == FailureCategory.DOCKER
 
 
+def test_category_taxonomy_has_thirteen_values():
+    from src.prediction.category_mapper import FailureCategory
+
+    assert len(FailureCategory) == 13
+    assert FailureCategory.UNKNOWN.value == "unknown"
+
+
 def test_category_mapper_unknown_without_evidence():
     category = map_failure_category()
     assert category == FailureCategory.UNKNOWN

@@ -279,8 +279,8 @@ Models are **not** committed to git (`models/*.joblib` is gitignored).
 | Workflow | Purpose |
 |----------|---------|
 | `.github/workflows/train-model.yml` | Manual (`workflow_dispatch`) or weekly schedule — collect real history, train, evaluate, upload artifact |
-| `.github/workflows/predict.yml` | Downloads latest `failure-predictor-model` artifact, runs pre-CI prediction (non-blocking) |
-| `.github/workflows/feedback.yml` | Records actual CI outcomes against pending predictions after workflows complete |
+| `.github/workflows/predict.yml` | Downloads latest `failure-predictor-model` artifact, runs pre-CI prediction (non-blocking), uploads `prediction-history` artifact |
+| `.github/workflows/feedback.yml` | After CI or controlled-failure workflows complete, downloads `prediction-history`, records actual outcomes, re-uploads artifact |
 
 Train a model in GitHub Actions:
 
@@ -298,7 +298,26 @@ python3 -m src.prediction.cli train --dataset data/historical_runs.csv
 
 Optional workflow: `.github/workflows/predict.yml`
 
-Runs on `pull_request` and `push` to `main`. It loads the trained model if present and prints failure probability **before** the main CI result is used. If no model exists, it skips gracefully and does not block CI.
+Runs on `pull_request` and `push` to `main`. It loads the trained model if present, records the prediction to `data/prediction_history.csv`, uploads that file as the `prediction-history` artifact, and prints failure probability **before** the main CI result is known. If no model exists, it skips gracefully and does not block CI.
+
+`feedback.yml` listens for completed **CI/CD Pipeline** and **Controlled CI Failure Generator** runs only (not pre-CI prediction itself), matches pending predictions by commit SHA, and persists outcomes via the same `prediction-history` artifact.
+
+## Validation Status (honest)
+
+| Component | Status |
+|-----------|--------|
+| ML pipeline (collect, features, train, predict, feedback) | **IMPLEMENTED** · **TESTED WITH SYNTHETIC DATA** |
+| Dataset validation & leakage guards | **IMPLEMENTED** · **TESTED WITH SYNTHETIC DATA** |
+| GitHub history collection CLI | **IMPLEMENTED** · **TESTED WITH REAL GITHUB DATA** (currently ~1 run in this repo) |
+| Model training on real repo history | **NOT TESTED** (insufficient runs / one outcome class) |
+| Pre-CI prediction in GitHub Actions | **IMPLEMENTED** · **NOT TESTED LIVE IN GITHUB ACTIONS** |
+| Feedback loop via `prediction-history` artifact | **IMPLEMENTED** · **NOT TESTED LIVE IN GITHUB ACTIONS** |
+| LangGraph RCA (Bedrock + Tavily) | **IMPLEMENTED** · **TESTED WITH SYNTHETIC/MOCKED DATA** · **NOT TESTED LIVE** |
+| Culprit commit analyzer | **IMPLEMENTED** · **TESTED WITH SYNTHETIC DATA** |
+| Streamlit UI | **IMPLEMENTED** · **TESTED LOCALLY** (manual) |
+| Controlled failure workflow | **IMPLEMENTED** · **NOT TESTED LIVE IN GITHUB ACTIONS** |
+
+Unit tests do **not** prove production readiness. Live validation requires pushing workflows, generating ≥20 varied CI runs, training a model artifact, and observing predict + feedback on real Actions runs.
 
 ## Limitations
 

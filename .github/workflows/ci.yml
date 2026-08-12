@@ -95,8 +95,8 @@ jobs:
 
       - name: Validate prediction pipeline software
         run: |
-          pytest -q tests/test_prediction.py \
-            -k "feature_extraction or history_store or trainer_predictor or category_model or collector_builds"
+          pytest -q tests/test_prediction.py tests/test_extensions.py tests/test_gha_actions.py \
+            -k "feature_extraction or history_store or trainer_predictor or category_model or collector_builds or dataset_validator or feedback or corrupt or probability or gha_"
 
   build:
     name: Build / App Validation

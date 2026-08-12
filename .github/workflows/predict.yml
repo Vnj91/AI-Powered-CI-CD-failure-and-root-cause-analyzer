@@ -31,6 +31,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Prepare artifact directories
+        run: mkdir -p models data
+
       - name: Download latest trained model artifact
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
@@ -41,71 +44,26 @@ jobs:
           path: models/
           if_no_artifact_found: warn
 
+      - name: Download prediction history artifact
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          name: prediction-history
+          path: data/
+          if_no_artifact_found: warn
+
       - name: Run pre-CI failure prediction
         env:
           GITHUB_ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python3 - <<'PY'
-          import os
-          import sys
+        run: python3 -m src.prediction.gha_actions predict
 
-          from config import Config
-          from src.prediction.data_collector import HistoricalRunCollector
-          from src.prediction.feature_extractor import FailureFeatureExtractor
-          from src.prediction.predictor import FailurePredictor
-
-          repo = os.environ.get("GITHUB_REPOSITORY", "")
-          sha = os.environ.get("GITHUB_SHA", "")
-          ref = os.environ.get("GITHUB_REF", "")
-          branch = ref.split("/")[-1] if ref else "main"
-          model_path = Config.PREDICTOR_MODEL_PATH
-
-          print("CI Failure Prediction")
-          print("---------------------")
-
-          if not repo or not sha:
-              print("Prediction skipped — missing repository context.")
-              sys.exit(0)
-
-          if not model_path.exists():
-              print("Prediction model unavailable — skipping prediction.")
-              print("Run the 'Train Failure Predictor' workflow to publish a model artifact.")
-              sys.exit(0)
-
-          if not os.environ.get("GITHUB_ACCESS_TOKEN"):
-              print("Prediction model unavailable — GITHUB_ACCESS_TOKEN not configured.")
-              sys.exit(0)
-
-          collector = HistoricalRunCollector()
-          features = collector.build_prediction_features(
-              repository=repo,
-              commit_sha=sha,
-              branch=branch,
-          )
-          feature_row = FailureFeatureExtractor.to_feature_row(features)
-          prediction = FailurePredictor(
-              model_path,
-              category_model_path=Config.CATEGORY_MODEL_PATH,
-          ).predict(feature_row)
-
-          if not prediction.model_available:
-              print("Prediction model unavailable — skipping prediction.")
-              sys.exit(0)
-
-          probability = prediction.failure_probability or 0.0
-          outcome = "FAILURE" if prediction.predicted_failure else "SUCCESS"
-          print(f"Probability: {probability:.0%}")
-          print(f"Risk: {prediction.risk_level}")
-          print(f"Predicted outcome: {outcome}")
-          if prediction.predicted_category:
-              suffix = (
-                  f" ({prediction.category_confidence:.0%})"
-                  if prediction.category_confidence is not None
-                  else ""
-              )
-              print(f"Predicted category: {prediction.predicted_category}{suffix}")
-          if prediction.top_risk_factors:
-              print("Risk factors associated with this prediction:")
-              for factor in prediction.top_risk_factors[:5]:
-                  print(f"- {factor.feature}: value={factor.value:.2f}, importance={factor.importance:.4f}")
-          PY
+      - name: Upload prediction history artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prediction-history
+          path: data/prediction_history.csv
+          if-no-files-found: ignore
+          retention-days: 90
+          overwrite: true

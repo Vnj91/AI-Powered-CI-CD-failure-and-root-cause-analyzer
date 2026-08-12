@@ -4,13 +4,13 @@ on:
   workflow_run:
     workflows:
       - CI/CD Pipeline
-      - Pre-CI Failure Prediction
       - Controlled CI Failure Generator (Dev/Testing Only)
     types:
       - completed
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   record-outcome:
@@ -33,45 +33,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Prepare data directory
+        run: mkdir -p data
+
+      - name: Download prediction history artifact
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          name: prediction-history
+          path: data/
+          if_no_artifact_found: warn
+
       - name: Record workflow outcome against pending prediction
         env:
           GITHUB_REPOSITORY: ${{ github.event.workflow_run.repository.full_name }}
           GITHUB_SHA: ${{ github.event.workflow_run.head_sha }}
           GITHUB_RUN_ID: ${{ github.event.workflow_run.id }}
           GITHUB_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
-        run: |
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
+          GITHUB_WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+        run: python3 -m src.prediction.gha_actions feedback
 
-          from config import Config
-          from src.prediction.history_store import PredictionHistoryStore
-
-          repo = os.environ["GITHUB_REPOSITORY"]
-          sha = os.environ["GITHUB_SHA"]
-          run_id = int(os.environ["GITHUB_RUN_ID"])
-          conclusion = os.environ["GITHUB_CONCLUSION"]
-
-          history_path = Path(Config.PREDICTION_HISTORY_PATH)
-          if not history_path.exists():
-              print("No prediction history file yet — nothing to update.")
-              raise SystemExit(0)
-
-          store = PredictionHistoryStore(history_path)
-          ok, prediction_id, status = store.record_outcome_by_run_id(
-              run_id=run_id,
-              conclusion=conclusion,
-          )
-
-          if ok:
-              print(f"Feedback recorded: prediction_id={prediction_id} status={status}")
-              raise SystemExit(0)
-
-          ok, prediction_id, status = store.record_outcome_for_commit(
-              repository=repo,
-              commit_sha=sha,
-              conclusion=conclusion,
-              run_id=run_id,
-          )
-          print(f"Feedback by commit: updated={ok} prediction_id={prediction_id} status={status}")
-          PY
+      - name: Upload updated prediction history artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prediction-history
+          path: data/prediction_history.csv
+          if-no-files-found: ignore
+          retention-days: 90
+          overwrite: true
