@@ -117,6 +117,53 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Automated CI Training Data Generation
+
+Phase 1 builds and validates an **execution plan only**. It does **not** dispatch GitHub Actions, modify `main`, delete branches, or write to `historical_runs.csv`.
+
+What Phase 1 does:
+
+- Validates requested success/failure counts
+- Generates deterministic scenarios via `DeterministicScenarioPlanner`
+- Validates scenario distribution across five failure categories and five success change types
+- Prints a human-readable execution plan
+- Optionally writes `data/generated_run_plan.json` (gitignored)
+
+Dry run:
+
+```bash
+python3 scripts/generate_training_data.py --dry-run
+```
+
+Plan 30 runs (15 success + 15 failure):
+
+```bash
+python3 scripts/generate_training_data.py \
+  --runs 30 \
+  --success-runs 15 \
+  --failure-runs 15 \
+  --dry-run
+```
+
+Write the JSON plan without `--dry-run`:
+
+```bash
+python3 scripts/generate_training_data.py \
+  --runs 30 \
+  --success-runs 15 \
+  --failure-runs 15
+```
+
+Safety limits:
+
+- Default maximum: **50 runs**
+- Use `--allow-large-run-set` only when you intentionally need more
+- Never modifies `main`, `historical_runs.csv`, or fabricates workflow results
+
+Future phases (not enabled yet) will execute isolated `ml-data/*` branches and dispatch real workflows via `ci.yml` and `test-failure.yml`.
+
+## Automated Real CI Training Data Generation (future execution phase)
+
 ## Building a Real Historical CI Dataset
 
 This project learns from **genuine GitHub Actions workflow runs**. Do not fabricate CSV rows or synthetic labels.

@@ -30,6 +30,8 @@ class Config:
     # Prediction Artifacts
     HISTORICAL_DATASET_PATH = DATA_DIR / "historical_runs.csv"
     PREDICTION_HISTORY_PATH = DATA_DIR / "prediction_history.csv"
+    GENERATED_RUNS_PATH = DATA_DIR / "generated_runs.json"
+    GENERATED_RUN_PLAN_PATH = DATA_DIR / "generated_run_plan.json"
     PREDICTOR_MODEL_PATH = MODELS_DIR / "failure_predictor.joblib"
     PREDICTOR_METADATA_PATH = MODELS_DIR / "failure_predictor_metadata.json"
     CATEGORY_MODEL_PATH = MODELS_DIR / "failure_category_predictor.joblib"

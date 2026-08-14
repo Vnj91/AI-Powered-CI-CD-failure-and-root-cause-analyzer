@@ -3,6 +3,8 @@
 __pycache__/
 *.pyc
 data/*.csv
+data/generated_run_plan.json
+data/generated_runs.json
 models/*.joblib
 models/*.json
 # output/*.txt
