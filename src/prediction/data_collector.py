@@ -47,7 +47,8 @@ class HistoricalRunCollector:
     """Collect workflow runs and flatten them into a trainable dataset."""
 
     def __init__(self, token: Optional[str] = None, recent_window: int = 10):
-        self.token = token or GITHUB_ACCESS_TOKEN
+        # An explicit empty token is a caller error; only an omitted token may use configuration.
+        self.token = GITHUB_ACCESS_TOKEN if token is None else token
         self.recent_window = recent_window
         if not self.token:
             raise ValueError("GITHUB_ACCESS_TOKEN is required to collect GitHub Actions history")

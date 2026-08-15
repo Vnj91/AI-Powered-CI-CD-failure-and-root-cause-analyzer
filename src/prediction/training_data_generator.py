@@ -138,29 +138,51 @@ class GhCliClient:
         self._last_dispatch_at = time.monotonic()
         time.sleep(2)
 
-    def find_latest_run_id(self, workflow_file: str, branch: str) -> int:
-        result = self._run(
-            [
-                "gh",
-                "run",
-                "list",
-                "--repo",
-                self.repo,
-                "--workflow",
-                workflow_file,
-                "--branch",
-                branch,
-                "--limit",
-                "1",
-                "--json",
-                "databaseId,headSha,createdAt",
-            ],
-            check=True,
-        )
-        payload = json.loads(result.stdout or "[]")
-        if not payload:
-            raise RuntimeError(f"No workflow run found for {workflow_file} on {branch}")
-        return int(payload[0]["databaseId"])
+    def find_latest_run_id(
+        self,
+        workflow_file: str,
+        branch: str,
+        *,
+        max_attempts: int = 10,
+        retry_delay_seconds: float = 3.0,
+    ) -> int:
+        """Wait briefly for GitHub Actions to register a newly dispatched workflow."""
+
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+
+        command = [
+            "gh",
+            "run",
+            "list",
+            "--repo",
+            self.repo,
+            "--workflow",
+            workflow_file,
+            "--branch",
+            branch,
+            "--limit",
+            "1",
+            "--json",
+            "databaseId,headSha,createdAt",
+        ]
+        last_error: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = self._run(command, check=True)
+                payload = json.loads(result.stdout or "[]")
+                if payload:
+                    return int(payload[0]["databaseId"])
+                last_error = RuntimeError("GitHub Actions has not registered the workflow run yet.")
+            except subprocess.CalledProcessError as exc:
+                last_error = exc
+
+            if attempt < max_attempts:
+                time.sleep(retry_delay_seconds)
+
+        raise RuntimeError(
+            f"No workflow run found for {workflow_file} on {branch} after {max_attempts} attempts."
+        ) from last_error
 
     def get_run(self, run_id: int) -> dict[str, Any]:
         result = self._run(

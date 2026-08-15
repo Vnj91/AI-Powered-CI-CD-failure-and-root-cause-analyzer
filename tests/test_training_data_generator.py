@@ -245,6 +245,28 @@ def test_command_wrappers_capture_text_when_they_inspect_output(tmp_path: Path):
         assert kwargs["text"] is True
 
 
+def test_run_discovery_retries_transient_error_and_empty_result(monkeypatch):
+    class DelayedDiscoveryRunner:
+        def __init__(self):
+            self.attempts = 0
+
+        def run(self, command, **kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise subprocess.CalledProcessError(1, command)
+            if self.attempts == 2:
+                return subprocess.CompletedProcess(command, 0, stdout="[]", stderr="")
+            return subprocess.CompletedProcess(command, 0, stdout='[{"databaseId": 456}]', stderr="")
+
+    runner = DelayedDiscoveryRunner()
+    monkeypatch.setattr("src.prediction.training_data_generator.time.sleep", lambda _: None)
+    run_id = GhCliClient("owner/repo", runner=runner).find_latest_run_id(
+        "ci.yml", "ml-data/success-011", max_attempts=3, retry_delay_seconds=0
+    )
+    assert run_id == 456
+    assert runner.attempts == 3
+
+
 @pytest.mark.parametrize("conclusion", ["success", "failure", "cancelled", "skipped", "timed_out"])
 def test_dispatch_and_poll_records_actual_github_conclusion(tmp_path: Path, conclusion: str):
     runner = LiveWorkflowRunner(conclusion)
