@@ -10,7 +10,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Protocol
+from typing import Any, Callable, Optional, Protocol
 
 from config import Config
 from src.prediction.dataset_validator import validate_dataset
@@ -64,6 +64,10 @@ class GenerationProgress:
 
 class RateLimitError(RuntimeError):
     pass
+
+
+class WorkflowTimeoutError(RuntimeError):
+    """Raised when a real workflow does not finish within the requested limit."""
 
 
 class GhCliClient:
@@ -155,26 +159,29 @@ class GhCliClient:
             raise RuntimeError(f"No workflow run found for {workflow_file} on {branch}")
         return int(payload[0]["databaseId"])
 
-    def wait_for_run(self, run_id: int, poll_interval: int) -> dict[str, Any]:
+    def get_run(self, run_id: int) -> dict[str, Any]:
+        result = self._run(
+            [
+                "gh", "run", "view", str(run_id), "--repo", self.repo,
+                "--json", "status,conclusion,headSha,workflowName,createdAt,updatedAt,url",
+            ],
+            check=True,
+        )
+        return json.loads(result.stdout or "{}")
+
+    def wait_for_run(self, run_id: int, poll_interval: int, timeout: int = 900) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
         while True:
-            result = self._run(
-                [
-                    "gh",
-                    "run",
-                    "view",
-                    str(run_id),
-                    "--repo",
-                    self.repo,
-                    "--json",
-                    "status,conclusion,headSha,workflowName,createdAt,updatedAt,url",
-                ],
-                check=True,
-            )
-            payload = json.loads(result.stdout or "{}")
+            payload = self.get_run(run_id)
             status = payload.get("status")
             if status == "completed":
                 return payload
-            time.sleep(poll_interval)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise WorkflowTimeoutError(
+                    f"Workflow run {run_id} did not complete within {timeout} seconds."
+                )
+            time.sleep(min(poll_interval, remaining))
 
     def delete_branch(self, branch: str) -> None:
         owner, name = self.repo.split("/", 1)
@@ -209,7 +216,22 @@ class GitWorkspace:
                 "Working tree is not clean. Commit or stash local changes before generating training data."
             )
 
+    def current_branch(self) -> str:
+        result = self._run(["git", "branch", "--show-current"], check=True)
+        branch = result.stdout.strip()
+        if not branch:
+            raise RuntimeError(
+                "Live generation requires a checked-out branch; detached HEAD is not supported."
+            )
+        return branch
+
     def create_branch(self, branch: str, base_branch: str = "main") -> None:
+        if not branch.startswith("ml-data/"):
+            raise RuntimeError(f"Refusing to create non-generator branch: {branch}")
+        print(f"Preparing generator branch {branch} from origin/{base_branch}.")
+        # Populate the remote-tracking ref when an aborted generator branch already exists,
+        # so the later force-with-lease can safely replace that exact branch.
+        self._run(["git", "fetch", "origin", branch], check=False)
         self._run(["git", "checkout", "-B", branch, f"origin/{base_branch}"], check=True)
 
     def apply_changes(self, scenario: TrainingScenario) -> str:
@@ -231,12 +253,19 @@ class GitWorkspace:
         )
         rev = self._run(["git", "rev-parse", "HEAD"], check=True)
         sha = rev.stdout.strip()
-        push = self._run(["git", "push", "-u", "origin", scenario.branch_name], check=True)
+        if not scenario.branch_name.startswith("ml-data/"):
+            raise RuntimeError(f"Refusing to push non-generator branch: {scenario.branch_name}")
+        # A prior interrupted attempt may have left this generated branch on origin.
+        # Force-with-lease resets only that known generator branch and refuses a stale overwrite.
+        push = self._run(
+            ["git", "push", "--force-with-lease", "-u", "origin", scenario.branch_name],
+            check=True,
+        )
         _ = commit, push
         return sha
 
-    def return_to_base(self, base_branch: str = "main") -> None:
-        self._run(["git", "checkout", base_branch], check=False)
+    def return_to_branch(self, branch: str) -> None:
+        self._run(["git", "checkout", branch], check=False)
 
 
 class GeneratedRunStore:
@@ -273,6 +302,7 @@ class TrainingDataGenerator:
         git_workspace: GitWorkspace,
         store: GeneratedRunStore,
         poll_interval: int = 10,
+        timeout: int = 900,
     ):
         self.repo = repo
         self.repo_root = repo_root
@@ -280,8 +310,15 @@ class TrainingDataGenerator:
         self.git = git_workspace
         self.store = store
         self.poll_interval = poll_interval
+        self.timeout = timeout
 
-    def execute_scenario(self, scenario: TrainingScenario, *, dry_run: bool = False) -> GeneratedRunRecord:
+    def execute_scenario(
+        self,
+        scenario: TrainingScenario,
+        *,
+        dry_run: bool = False,
+        on_run_started: Optional[Callable[[GeneratedRunRecord], None]] = None,
+    ) -> GeneratedRunRecord:
         created_at = datetime.now(timezone.utc).isoformat()
         if dry_run:
             return GeneratedRunRecord(
@@ -304,22 +341,25 @@ class TrainingDataGenerator:
             inputs=scenario.workflow_inputs or None,
         )
         run_id = self.gh.find_latest_run_id(scenario.workflow_file, scenario.branch_name)
-        run_payload = self.gh.wait_for_run(run_id, self.poll_interval)
-        actual_conclusion = run_payload.get("conclusion")
-        completed_at = run_payload.get("updatedAt")
-
-        return GeneratedRunRecord(
+        started = GeneratedRunRecord(
             run_id=run_id,
-            workflow=str(run_payload.get("workflowName") or scenario.workflow_name),
+            workflow=scenario.workflow_name,
             branch=scenario.branch_name,
-            commit_sha=str(run_payload.get("headSha") or commit_sha),
+            commit_sha=commit_sha,
             expected_category=scenario.category,
             expected_outcome=scenario.expected_outcome,
-            actual_conclusion=actual_conclusion,
+            actual_conclusion=None,
             scenario_id=scenario.scenario_id,
             created_at=created_at,
-            completed_at=completed_at,
         )
+        if on_run_started is not None:
+            on_run_started(started)
+        run_payload = self.gh.wait_for_run(run_id, self.poll_interval, self.timeout)
+        started.actual_conclusion = run_payload.get("conclusion")
+        started.completed_at = run_payload.get("updatedAt")
+        started.commit_sha = str(run_payload.get("headSha") or commit_sha)
+        started.workflow = str(run_payload.get("workflowName") or scenario.workflow_name)
+        return started
 
     def generate(
         self,
@@ -331,37 +371,77 @@ class TrainingDataGenerator:
         progress = GenerationProgress(requested=len(scenarios))
         existing = self.store.load()
         records = list(existing)
+        completed_ids = {record.scenario_id for record in records if record.actual_conclusion}
+        pending_by_id = {
+            record.scenario_id: record
+            for record in records
+            if record.run_id is not None and not record.actual_conclusion
+        }
 
         if not dry_run:
             self.gh.ensure_gh_available()
             self.gh.ensure_authenticated()
             self.git.ensure_clean_base()
+            original_branch = self.git.current_branch()
+        else:
+            original_branch = None
 
         try:
             for scenario in scenarios:
+                if scenario.scenario_id in completed_ids:
+                    # Completed records are resumability checkpoints; never dispatch them twice.
+                    continue
                 try:
-                    record = self.execute_scenario(scenario, dry_run=dry_run)
+                    pending = pending_by_id.get(scenario.scenario_id)
+                    if pending is not None and not dry_run:
+                        run_payload = self.gh.wait_for_run(
+                            int(pending.run_id), self.poll_interval, self.timeout
+                        )
+                        pending.actual_conclusion = run_payload.get("conclusion")
+                        pending.completed_at = run_payload.get("updatedAt")
+                        pending.commit_sha = str(run_payload.get("headSha") or pending.commit_sha or "") or None
+                        pending.workflow = str(run_payload.get("workflowName") or pending.workflow)
+                        record = pending
+                    else:
+                        def persist_started(record: GeneratedRunRecord) -> None:
+                            records.append(record)
+                            self.store.save(records)
+
+                        record = self.execute_scenario(
+                            scenario,
+                            dry_run=dry_run,
+                            on_run_started=persist_started if not dry_run else None,
+                        )
                 except RateLimitError as exc:
                     progress.stopped_early = True
                     progress.stop_reason = str(exc)
                     break
 
-                records.append(record)
+                if record not in records:
+                    records.append(record)
                 progress.records.append(record)
                 progress.completed += 1
                 if not dry_run:
                     progress.branches_created.append(scenario.branch_name)
+                    self.store.save(records)
 
             if not dry_run:
                 self.store.save(records)
-                self.git.return_to_base()
+                if original_branch:
+                    self.git.return_to_branch(original_branch)
                 if cleanup:
-                    for branch in progress.branches_created:
+                    branches = sorted({
+                        record.branch for record in records
+                        if record.branch.startswith("ml-data/")
+                    })
+                    for branch in branches:
+                        print(f"Removing generated branch: {branch}")
                         self.gh.delete_branch(branch)
         except Exception:
             if not dry_run:
                 self.store.save(records)
-                self.git.return_to_base()
+                if original_branch:
+                    self.git.return_to_branch(original_branch)
             raise
 
         progress.records = records[-len(scenarios) :] if dry_run else progress.records
@@ -412,6 +492,8 @@ class TrainingDataGenerator:
             "train",
             "--dataset",
             str(dataset_path),
+            "--model",
+            str(Config.PREDICTOR_MODEL_PATH),
         ]
         train = subprocess.run(train_cmd, cwd=str(self.repo_root))
         if train.returncode != 0:
@@ -424,6 +506,8 @@ class TrainingDataGenerator:
             "evaluate",
             "--dataset",
             str(dataset_path),
+            "--model",
+            str(Config.PREDICTOR_MODEL_PATH),
         ]
         evaluate = subprocess.run(eval_cmd, cwd=str(self.repo_root))
         return evaluate.returncode
@@ -439,6 +523,11 @@ def summarize_generation(
     cancelled = sum(1 for record in records if record.actual_conclusion == "cancelled")
     skipped = sum(1 for record in records if record.actual_conclusion == "skipped")
     pending = sum(1 for record in records if record.actual_conclusion in (None, ""))
+    known = {"success", "failure", "cancelled", "skipped"}
+    unexpected = sum(
+        1 for record in records
+        if record.actual_conclusion not in known and record.actual_conclusion not in (None, "")
+    )
 
     category_counts: dict[str, int] = {}
     for record in records:
@@ -448,7 +537,7 @@ def summarize_generation(
                 category_counts[key] = category_counts.get(key, 0) + 1
 
     lines = [
-        "Generated runs:",
+        "REAL CI TRAINING DATA REPORT",
         f"  Requested: {progress.requested}",
         f"  Completed: {progress.completed}",
         "",
@@ -457,29 +546,28 @@ def summarize_generation(
         f"  Failure: {failure}",
         f"  Cancelled: {cancelled}",
         f"  Skipped: {skipped}",
+        f"  Unexpected outcomes: {unexpected}",
     ]
     if pending:
         lines.append(f"  Pending/unknown: {pending}")
     if progress.stopped_early:
         lines.extend(["", f"Stopped early: {progress.stop_reason}"])
-    if category_counts:
-        lines.extend(["", "Failure categories (actual failures):"])
-        for key in sorted(category_counts):
-            lines.append(f"  {key}: {category_counts[key]}")
+    lines.extend(["", "Failure categories (actual failures):"])
+    for key in ("lint", "test", "build", "dependency", "docker"):
+        lines.append(f"  {key}: {category_counts.get(key, 0)}")
 
     if dataset_report is not None:
         lines.extend(
             [
                 "",
-                "Dataset:",
-                f"  Total historical runs: {dataset_report.total_runs}",
-                f"  Success: {dataset_report.success_runs}",
-                f"  Failure: {dataset_report.failure_runs}",
+                "Historical dataset:",
+                f"  total_runs: {dataset_report.total_runs}",
+                f"  success_runs: {dataset_report.success_runs}",
+                f"  failure_runs: {dataset_report.failure_runs}",
                 "",
                 "Training readiness:",
-                f"  >=20 runs: {'YES' if dataset_report.total_runs >= 20 else 'NO'}",
-                f"  >=2 outcome classes: {'YES' if dataset_report.success_runs > 0 and dataset_report.failure_runs > 0 else 'NO'}",
                 f"  Sufficient for training: {'YES' if dataset_report.sufficient_for_training else 'NO'}",
+                f"  Sufficient for evaluation: {'YES' if dataset_report.sufficient_for_evaluation else 'NO'}",
             ]
         )
     return "\n".join(lines)
@@ -541,8 +629,7 @@ def format_execution_plan(
             ]
         )
     else:
-        lines.append("NO GITHUB ACTIONS WERE DISPATCHED.")
-        lines.append("Phase 1 supports planning only — workflow execution is not enabled yet.")
+        lines.append("Live execution is enabled; GitHub Actions will be dispatched after pre-flight checks.")
     return "\n".join(lines)
 
 

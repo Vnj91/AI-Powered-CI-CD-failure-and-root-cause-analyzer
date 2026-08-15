@@ -119,50 +119,61 @@ streamlit run app.py
 
 ## Automated CI Training Data Generation
 
-Phase 1 builds and validates an **execution plan only**. It does **not** dispatch GitHub Actions, modify `main`, delete branches, or write to `historical_runs.csv`.
+Phase 2 converts the deterministic scenarios into **real GitHub Actions workflow runs**. It never writes fabricated rows to `data/historical_runs.csv`: generated-run metadata is kept separately in the gitignored `data/generated_runs.json`, and `--collect` retrieves actual GitHub history.
 
-What Phase 1 does:
+Before live generation, make sure:
 
-- Validates requested success/failure counts
-- Generates deterministic scenarios via `DeterministicScenarioPlanner`
-- Validates scenario distribution across five failure categories and five success change types
-- Prints a human-readable execution plan
-- Optionally writes `data/generated_run_plan.json` (gitignored)
+- GitHub CLI is installed and authenticated (`gh auth login`).
+- The working directory is clean (`git status`).
+- Git author identity is configured (`git config user.name` and `git config user.email`).
 
-Dry run:
+Use this staged runbook. Do not skip the two-run validation.
 
-```bash
-python3 scripts/generate_training_data.py --dry-run
-```
+1. **Pre-flight check**
 
-Plan 30 runs (15 success + 15 failure):
+   ```bash
+   python3 scripts/generate_training_data.py --check-env
+   ```
 
-```bash
-python3 scripts/generate_training_data.py \
-  --runs 30 \
-  --success-runs 15 \
-  --failure-runs 15 \
-  --dry-run
-```
+2. **Dry run (planning mode)**
 
-Write the JSON plan without `--dry-run`:
+   ```bash
+   python3 scripts/generate_training_data.py --runs 30 --success-runs 15 --failure-runs 15 --dry-run
+   ```
 
-```bash
-python3 scripts/generate_training_data.py \
-  --runs 30 \
-  --success-runs 15 \
-  --failure-runs 15
-```
+3. **Live two-run validation**
+
+   ```bash
+   python3 scripts/generate_training_data.py --runs 2 --success-runs 1 --failure-runs 1 --execute
+   ```
+
+4. **Full 30-run generation and collection**
+
+   ```bash
+   python3 scripts/generate_training_data.py --runs 30 --success-runs 15 --failure-runs 15 --execute --collect
+   ```
+
+5. **Model inspection, training, and temporal evaluation**
+
+   ```bash
+   python3 -m src.prediction.cli inspect --dataset data/historical_runs.csv
+   python3 -m src.prediction.cli train --dataset data/historical_runs.csv --model models/failure_predictor.joblib
+   python3 -m src.prediction.cli evaluate --dataset data/historical_runs.csv --model models/failure_predictor.joblib
+   ```
+
+6. **Safe cleanup**
+
+   ```bash
+   python3 scripts/generate_training_data.py --cleanup
+   ```
+
+`--cleanup` considers only branches recorded by this generator whose names start with `ml-data/`; it never targets `main` or developer branches. A resumed scenario uses its existing completed metadata rather than dispatching a duplicate workflow. If an abandoned generated branch already exists, it is reset from `origin/main` and pushed using `--force-with-lease`, which limits the reset to that known generator branch and rejects stale remote changes.
 
 Safety limits:
 
-- Default maximum: **50 runs**
-- Use `--allow-large-run-set` only when you intentionally need more
-- Never modifies `main`, `historical_runs.csv`, or fabricates workflow results
-
-Future phases (not enabled yet) will execute isolated `ml-data/*` branches and dispatch real workflows via `ci.yml` and `test-failure.yml`.
-
-## Automated Real CI Training Data Generation (future execution phase)
+- Default maximum: **50 runs**; use `--allow-large-run-set` only when intentionally needed.
+- `--execute` is required for generation, collection, and training.
+- Polling defaults to 10 seconds with a 900-second per-workflow timeout; completed metadata is persisted after each run for safe resume.
 
 ## Building a Real Historical CI Dataset
 
@@ -427,6 +438,5 @@ docker stop cicd-test
 ```
 
 To build historical CI/CD data for the failure predictor, run this workflow on real pull requests and merges to `main`. Do not fabricate workflow outcomes — introduce controlled, real failures by temporarily breaking the relevant stage (for example, a lint violation, a failing assertion, or an outdated dependency) and reverting after the run is recorded.
-
 
 
