@@ -86,6 +86,9 @@ class GhCliClient:
 
     def _run(self, command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         full_command = list(command)
+        # CLI responses are inspected for authentication, rate limits, and JSON run data.
+        kwargs.setdefault("capture_output", True)
+        kwargs.setdefault("text", True)
         result = self.runner.run(full_command, **kwargs)
         combined = f"{result.stdout or ''}\n{result.stderr or ''}"
         if "rate limit" in combined.lower() or "API rate limit exceeded" in combined:
@@ -206,6 +209,9 @@ class GitWorkspace:
         self.runner = runner or subprocess
 
     def _run(self, command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        # Several Git operations inspect stdout; capture it consistently for every wrapper call.
+        kwargs.setdefault("capture_output", True)
+        kwargs.setdefault("text", True)
         return self.runner.run(command, cwd=str(self.repo_root), **kwargs)
 
     def ensure_clean_base(self, base_branch: str = "main") -> None:

@@ -227,6 +227,24 @@ def test_auth_failure_halts_execution_before_git_changes(tmp_path: Path):
     assert not any(call[:3] == ["gh", "workflow", "run"] for call in runner.calls)
 
 
+def test_command_wrappers_capture_text_when_they_inspect_output(tmp_path: Path):
+    class RecordingRunner:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, command, **kwargs):
+            self.calls.append((list(command), kwargs))
+            stdout = "" if command[:3] == ["git", "status", "--porcelain"] else "main\n"
+            return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    runner = RecordingRunner()
+    GitWorkspace(tmp_path, runner=runner).ensure_clean_base()
+    GhCliClient("owner/repo", runner=runner).ensure_authenticated()
+    for _, kwargs in runner.calls:
+        assert kwargs["capture_output"] is True
+        assert kwargs["text"] is True
+
+
 @pytest.mark.parametrize("conclusion", ["success", "failure", "cancelled", "skipped", "timed_out"])
 def test_dispatch_and_poll_records_actual_github_conclusion(tmp_path: Path, conclusion: str):
     runner = LiveWorkflowRunner(conclusion)
