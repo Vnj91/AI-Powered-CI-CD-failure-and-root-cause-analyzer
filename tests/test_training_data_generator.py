@@ -277,7 +277,7 @@ def test_dispatch_and_poll_records_actual_github_conclusion(tmp_path: Path, conc
     assert progress.records[0].actual_conclusion == conclusion
     assert any(call[:3] == ["gh", "workflow", "run"] for call in runner.calls)
     assert any(call[:3] == ["gh", "run", "view"] for call in runner.calls)
-    assert ["git", "push", "--force-with-lease", "-u", "origin", "ml-data/success-001"] in runner.calls
+    assert ["git", "push", "--force", "-u", "origin", "ml-data/success-001"] in runner.calls
 
 
 def test_completed_scenarios_are_skipped_when_resuming(tmp_path: Path):
