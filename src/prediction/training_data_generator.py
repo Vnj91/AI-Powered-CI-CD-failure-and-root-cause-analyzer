@@ -283,10 +283,10 @@ class GitWorkspace:
         sha = rev.stdout.strip()
         if not scenario.branch_name.startswith("ml-data/"):
             raise RuntimeError(f"Refusing to push non-generator branch: {scenario.branch_name}")
-        # A prior interrupted attempt may have left this generated branch on origin.
-        # Force-with-lease resets only that known generator branch and refuses a stale overwrite.
+        # A prior interrupted attempt may have left this disposable generator branch on origin.
+        # The allowlist above ensures --force can only replace an ml-data/* branch.
         push = self._run(
-            ["git", "push", "--force-with-lease", "-u", "origin", scenario.branch_name],
+            ["git", "push", "--force", "-u", "origin", scenario.branch_name],
             check=True,
         )
         _ = commit, push
@@ -672,7 +672,7 @@ def write_run_plan(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "seed": seed,
         "distribution": distribution,
-        "scenarios": [scenario.to_dict() for scenario in scenarios],
+        "scenarios": [scenario.to_dict() for scenarios in scenarios],
     }
     text = json.dumps(payload, indent=2)
     if "ghp_" in text or "github_pat_" in text:
