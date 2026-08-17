@@ -672,7 +672,7 @@ def write_run_plan(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "seed": seed,
         "distribution": distribution,
-        "scenarios": [scenario.to_dict() for scenarios in scenarios],
+        "scenarios": [scenario.to_dict() for scenario in scenarios],
     }
     text = json.dumps(payload, indent=2)
     if "ghp_" in text or "github_pat_" in text:
