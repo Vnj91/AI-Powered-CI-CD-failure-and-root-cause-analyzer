@@ -185,14 +185,19 @@ class GhCliClient:
         ) from last_error
 
     def get_run(self, run_id: int) -> dict[str, Any]:
-        result = self._run(
-            [
-                "gh", "run", "view", str(run_id), "--repo", self.repo,
-                "--json", "status,conclusion,headSha,workflowName,createdAt,updatedAt,url",
-            ],
-            check=True,
-        )
-        return json.loads(result.stdout or "{}")
+        command = [
+            "gh", "run", "view", str(run_id), "--repo", self.repo,
+            "--json", "status,conclusion,headSha,workflowName,createdAt,updatedAt,url",
+        ]
+        for attempt in range(5):
+            try:
+                result = self._run(command, check=True)
+                return json.loads(result.stdout or "{}")
+            except subprocess.CalledProcessError:
+                if attempt == 4:
+                    raise
+                time.sleep(3)
+        return {}
 
     def wait_for_run(self, run_id: int, poll_interval: int, timeout: int = 900) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
