@@ -10,6 +10,24 @@ enableXsrfProtection = true
 [browser]
 gatherUsageStats = false
 
+[theme]
+base = "light"
+primaryColor = "#0f766e"
+backgroundColor = "#f7f9fc"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#142238"
+grayTextColor = "#5f6f82"
+linkColor = "#0f766e"
+baseRadius = "medium"
+
+[theme.sidebar]
+primaryColor = "#7dd3c7"
+backgroundColor = "#262730"
+secondaryBackgroundColor = "#0e1117"
+textColor = "#fafafa"
+grayTextColor = "#c6c8ce"
+linkColor = "#7dd3c7"
+
 [client]
 showErrorDetails = "none"
 toolbarMode = "minimal"
