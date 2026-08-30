@@ -463,14 +463,14 @@ duplicate push/PR predictor workflows and commit-SHA matching races.
 | Dataset validation, temporal split & leakage guards | **IMPLEMENTED** · **AUTOMATED TESTS PASS** |
 | GitHub history collection CLI | **VALIDATED** · collected 37 real public runs (16 success / 21 failure) |
 | Model training on real repo history | **VALIDATED, EXPERIMENTAL** · chronological 21/16 split; holdout accuracy 12.5%, F1 0.0 |
-| Pre-CI prediction in GitHub Actions | **IMPLEMENTED** · dependency/runtime path exercised in live PR CI; final green validation pending this branch run |
+| Pre-CI prediction in GitHub Actions | **LIVE VALIDATED** · PR run `33322344708` completed successfully on Python 3.11 |
 | Feedback loop via `prediction-history` artifact | **IMPLEMENTED** · **NOT TESTED LIVE IN GITHUB ACTIONS** |
 | GHCR dashboard image publishing on `main` | **IMPLEMENTED** · **NOT TESTED LIVE IN GITHUB ACTIONS** |
 | LangGraph AI enrichment (Bedrock or Ollama; Tavily optional) | **IMPLEMENTED** · **AUTOMATED PROVIDER/WORKFLOW TESTS PASS** · external model invocation not performed in this audit |
 | Culprit commit analyzer | **IMPLEMENTED** · **AUTOMATED TESTS PASS** |
 | Offline log RCA | **IMPLEMENTED** · **AUTOMATED TESTS PASS** |
 | Streamlit dashboard | **IMPLEMENTED** · **APPTEST + LOCAL HEALTH + BROWSER JOURNEY PASS** |
-| Docker/Compose deployment | **IMPLEMENTED** · **STATICALLY VALIDATED** · **RUNTIME REQUIRES DOCKER** |
+| Docker/Compose deployment | **IMPLEMENTED** · Compose statically validated; image build + container health passed in PR run `33322344708` |
 | Controlled failure workflow | **IMPLEMENTED** · 17 completed runs observed in upstream history |
 
 Local verification currently passes `ruff`, `compileall`, `pip-audit`, and all
