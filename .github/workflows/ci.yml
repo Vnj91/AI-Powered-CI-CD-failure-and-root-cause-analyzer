@@ -19,15 +19,161 @@ env:
   IMAGE_NAME: cicd-root-cause-analyzer:test
 
 jobs:
+  predict-failure-risk:
+    name: Predict Failure Risk (experimental)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    concurrency:
+      group: prediction-history-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout the commit being evaluated
+        uses: actions/checkout@v6
+        with:
+          # pull_request's default GITHUB_SHA is a synthetic merge commit. The
+          # model must score the real application commit that CI is evaluating.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install prediction dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Prepare prediction directories
+        run: mkdir -p data models
+
+      - name: Download latest trusted model artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)"
+          found=false
+          while IFS= read -r run_id; do
+            if gh run download "${run_id}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --name failure-predictor-model \
+              --dir models; then
+              found=true
+              break
+            fi
+          done < <(
+            gh run list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --workflow train-model.yml \
+              --branch "${default_branch}" \
+              --status success \
+              --limit 20 \
+              --json databaseId \
+              --jq '.[].databaseId'
+          )
+          if [ "${found}" = false ]; then
+            echo "No trusted model artifact exists yet; prediction will report unavailable."
+          fi
+
+      - name: Restore latest finalized prediction history
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          found=false
+          while IFS= read -r run_id; do
+            if gh run download "${run_id}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --name prediction-history \
+              --dir data; then
+              found=true
+              break
+            fi
+          done < <(
+            gh run list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --workflow feedback.yml \
+              --status success \
+              --limit 20 \
+              --json databaseId \
+              --jq '.[].databaseId'
+          )
+          if [ "${found}" = false ]; then
+            echo "No finalized history artifact exists yet; starting a new history."
+          fi
+
+      - name: Predict failure percentage from the real commit
+        id: prediction
+        continue-on-error: true
+        env:
+          GITHUB_ACCESS_TOKEN: ${{ github.token }}
+          GITHUB_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GITHUB_REF: refs/heads/${{ github.head_ref || github.ref_name }}
+          TARGET_WORKFLOW_NAME: CI/CD Pipeline
+        run: |
+          set -o pipefail
+          python -m src.prediction.gha_actions predict | tee prediction-output.txt
+
+      - name: Publish prediction summary
+        if: always()
+        run: |
+          {
+            echo "### Experimental pre-CI failure prediction"
+            echo
+            echo "Commit: \`${{ github.event.pull_request.head.sha || github.sha }}\`"
+            echo
+            echo '```text'
+            if [ -f prediction-output.txt ]; then
+              cat prediction-output.txt
+            else
+              echo "Prediction command did not produce output."
+            fi
+            echo '```'
+            echo
+            echo "> This model is advisory and does not gate CI or releases."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Stage run-linked prediction snapshot
+        if: always()
+        run: |
+          mkdir -p prediction-snapshot-artifact
+          if [ -f data/prediction_history.csv ]; then
+            cp data/prediction_history.csv prediction-snapshot-artifact/
+          fi
+          if [ -f prediction-output.txt ]; then
+            cp prediction-output.txt prediction-snapshot-artifact/
+          fi
+
+      - name: Upload run-linked prediction snapshot
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: prediction-snapshot
+          path: prediction-snapshot-artifact/
+          if-no-files-found: warn
+          retention-days: 90
+
   lint:
     name: Lint & Static Checks
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
@@ -45,13 +191,16 @@ jobs:
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: lint
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -67,7 +216,7 @@ jobs:
 
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: coverage.xml
@@ -76,13 +225,16 @@ jobs:
   prediction-tests:
     name: Prediction Module Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: unit-tests
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -101,13 +253,16 @@ jobs:
   build:
     name: Build / App Validation
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: prediction-tests
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -155,13 +310,16 @@ jobs:
   security:
     name: Dependency Security Check
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: prediction-tests
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -179,7 +337,7 @@ jobs:
 
       - name: Upload security report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pip-audit-report
           path: pip-audit-report.json
@@ -188,16 +346,19 @@ jobs:
   docker-build:
     name: Docker Build & Validate
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [build, security]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
@@ -227,17 +388,77 @@ jobs:
           docker logs "${cid}" || true
           exit 1
 
+  container-publish:
+    name: Publish Dashboard Image (main)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: docker-build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Resolve lowercase GHCR image name
+        id: image
+        run: |
+          repository="${GITHUB_REPOSITORY,,}"
+          echo "name=ghcr.io/${repository}" >> "${GITHUB_OUTPUT}"
+          echo "short_sha=${GITHUB_SHA::12}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and publish immutable dashboard image
+        id: publish
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:sha-${{ steps.image.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Publish container summary
+        run: |
+          {
+            echo "### Dashboard container published"
+            echo
+            echo "- Image: \`${{ steps.image.outputs.name }}\`"
+            echo "- Immutable tag: \`sha-${{ steps.image.outputs.short_sha }}\`"
+            echo "- Digest: \`${{ steps.publish.outputs.digest }}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
   release-artifact:
     name: Release Artifact (main)
     runs-on: ubuntu-latest
-    needs: docker-build
+    timeout-minutes: 20
+    needs: [docker-build, container-publish]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -249,11 +470,62 @@ jobs:
           pip install -r requirements.txt
           python -m compileall -q app.py config.py src
           mkdir -p release-bundle
-          tar -czf release-bundle/cicd-root-cause-analyzer.tar.gz \
-            app.py config.py requirements.txt src Dockerfile README.md .env.example
+          tar \
+            --exclude='*/__pycache__' \
+            --exclude='*.pyc' \
+            -czf release-bundle/cicd-root-cause-analyzer.tar.gz \
+            app.py \
+            config.py \
+            requirements.txt \
+            src \
+            Dockerfile \
+            .dockerignore \
+            compose.yaml \
+            .streamlit/config.toml \
+            README.md \
+            docs/DEPLOYMENT.md \
+            .env.example
+
+      - name: Verify deployment bundle contents
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import tarfile
+
+          archive = Path("release-bundle/cicd-root-cause-analyzer.tar.gz")
+          required = {
+              "app.py",
+              "config.py",
+              "requirements.txt",
+              "src/main.py",
+              "Dockerfile",
+              ".dockerignore",
+              "compose.yaml",
+              ".streamlit/config.toml",
+              "README.md",
+              "docs/DEPLOYMENT.md",
+              ".env.example",
+          }
+
+          with tarfile.open(archive, "r:gz") as bundle:
+              members = {member.name for member in bundle.getmembers()}
+
+          missing = sorted(required - members)
+          if missing:
+              raise SystemExit(f"Deployment bundle is missing: {', '.join(missing)}")
+
+          generated = sorted(
+              name for name in members if "__pycache__" in name or name.endswith(".pyc")
+          )
+          if generated:
+              raise SystemExit(f"Deployment bundle contains generated bytecode: {generated}")
+
+          print(f"Verified {len(members)} deployment bundle entries")
+          PY
 
       - name: Upload release bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-bundle
           path: release-bundle/cicd-root-cause-analyzer.tar.gz
+          retention-days: 30

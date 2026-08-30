@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from tavily import TavilyClient
 
+from ..utils.redaction import redact_sensitive_text
+
 
 load_dotenv()
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
@@ -77,6 +79,7 @@ class TavilySearchTool:
         Returns:
             SearchResponse with results and optional answer
         """
+        query = redact_sensitive_text(query, limit=500)
         print(f"🔍 Searching: \"{query}\"")
         
         try:
@@ -136,4 +139,3 @@ class TavilySearchTool:
             all_responses.append(response)
         
         return all_responses
-

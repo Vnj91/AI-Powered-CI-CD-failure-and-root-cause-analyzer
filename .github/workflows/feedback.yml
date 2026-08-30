@@ -4,7 +4,6 @@ on:
   workflow_run:
     workflows:
       - CI/CD Pipeline
-      - Controlled CI Failure Generator (Dev/Testing Only)
     types:
       - completed
 
@@ -12,17 +11,27 @@ permissions:
   contents: read
   actions: read
 
+# Artifacts are immutable and run-scoped. Serializing the merge prevents two
+# completed CI runs from publishing divergent "latest" prediction histories.
+concurrency:
+  group: prediction-history-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   record-outcome:
-    name: Record CI Outcome
+    name: Record Actual CI Outcome
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: ${{ github.event.workflow_run.conclusion != '' }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout trusted default-branch code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -33,33 +42,148 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Prepare data directory
-        run: mkdir -p data
+      - name: Prepare artifact directories
+        run: mkdir -p data prior-history run-snapshot
 
-      - name: Download prediction history artifact
-        uses: dawidd6/action-download-artifact@v6
-        continue-on-error: true
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          name: prediction-history
-          path: data/
-          if_no_artifact_found: warn
+      - name: Download prediction snapshot from the completed CI run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          if ! gh run download "${SOURCE_RUN_ID}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --name prediction-snapshot \
+            --dir run-snapshot; then
+            echo "The completed CI run had no prediction snapshot."
+          fi
 
-      - name: Record workflow outcome against pending prediction
+      - name: Download latest finalized prediction history
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          found=false
+          while IFS= read -r run_id; do
+            if gh run download "${run_id}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --name prediction-history \
+              --dir prior-history; then
+              found=true
+              break
+            fi
+          done < <(
+            gh run list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --workflow feedback.yml \
+              --status success \
+              --limit 20 \
+              --json databaseId \
+              --jq '.[].databaseId'
+          )
+          if [ "${found}" = false ]; then
+            echo "No finalized history exists yet."
+          fi
+
+      - name: Merge immutable run snapshot with finalized history
+        id: merge
+        env:
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          import pandas as pd
+
+          maximum_bytes = 10 * 1024 * 1024
+          snapshot = Path("run-snapshot/prediction_history.csv")
+          prior = Path("prior-history/prediction_history.csv")
+          output = Path("data/prediction_history.csv")
+          source_run_id = int(os.environ["SOURCE_RUN_ID"])
+
+          frames = []
+          # Snapshot first, finalized history second: an already-recorded
+          # outcome wins over a stale pending copy of the same prediction.
+          for candidate in (snapshot, prior):
+              if not candidate.exists():
+                  continue
+              if candidate.stat().st_size > maximum_bytes:
+                  raise SystemExit(f"Refusing oversized history artifact: {candidate}")
+              frame = pd.read_csv(candidate)
+              if "prediction_id" not in frame.columns or "run_id" not in frame.columns:
+                  raise SystemExit(f"Invalid prediction history schema: {candidate}")
+              frames.append(frame)
+
+          has_prediction = False
+          if frames:
+              merged = pd.concat(frames, ignore_index=True, sort=False)
+              merged = merged.drop_duplicates(subset=["prediction_id"], keep="last")
+              if "timestamp" in merged.columns:
+                  merged["_sort_timestamp"] = pd.to_datetime(
+                      merged["timestamp"], errors="coerce", utc=True
+                  )
+                  merged = merged.sort_values(
+                      ["_sort_timestamp", "prediction_id"], kind="mergesort"
+                  ).drop(columns=["_sort_timestamp"])
+              run_ids = pd.to_numeric(merged["run_id"], errors="coerce")
+              has_prediction = bool((run_ids == source_run_id).any())
+              output.parent.mkdir(parents=True, exist_ok=True)
+              merged.to_csv(output, index=False)
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as handle:
+              handle.write(f"has_prediction={str(has_prediction).lower()}\n")
+          print(f"Merged history available={output.exists()} source prediction={has_prediction}")
+          PY
+
+      - name: Record workflow outcome against its run-linked prediction
+        id: feedback
+        if: steps.merge.outputs.has_prediction == 'true'
         env:
           GITHUB_REPOSITORY: ${{ github.event.workflow_run.repository.full_name }}
           GITHUB_SHA: ${{ github.event.workflow_run.head_sha }}
           GITHUB_RUN_ID: ${{ github.event.workflow_run.id }}
           GITHUB_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           GITHUB_WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
-        run: python3 -m src.prediction.gha_actions feedback
+        run: |
+          set -o pipefail
+          python -m src.prediction.gha_actions feedback | tee feedback-output.txt
 
-      - name: Upload updated prediction history artifact
+      - name: Publish feedback summary
         if: always()
-        uses: actions/upload-artifact@v4
+        run: |
+          {
+            echo "### Prediction feedback"
+            echo
+            echo "- CI run: [${{ github.event.workflow_run.id }}](${{ github.event.workflow_run.html_url }})"
+            echo "- Commit: \`${{ github.event.workflow_run.head_sha }}\`"
+            echo "- Actual conclusion: **${{ github.event.workflow_run.conclusion }}**"
+            echo
+            echo '```text'
+            if [ -f feedback-output.txt ]; then
+              cat feedback-output.txt
+            else
+              echo "No run-linked prediction was available to update."
+            fi
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Stage finalized prediction history
+        if: always()
+        run: |
+          mkdir -p prediction-history-artifact
+          if [ -f data/prediction_history.csv ]; then
+            cp data/prediction_history.csv prediction-history-artifact/
+          fi
+          if [ -f feedback-output.txt ]; then
+            cp feedback-output.txt prediction-history-artifact/
+          fi
+
+      - name: Upload finalized prediction history
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
           name: prediction-history
-          path: data/prediction_history.csv
+          path: prediction-history-artifact/
           if-no-files-found: ignore
           retention-days: 90
-          overwrite: true

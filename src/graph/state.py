@@ -127,6 +127,8 @@ class DebuggingBrief(BaseModel):
         md.append(f"Generated: {self.generated_at.strftime('%Y-%m-%d %H:%M:%S')}")
         if self.repository:
             md.append(f"Repository: `{self.repository}`")
+        if self.workflow_run_id is not None:
+            md.append(f"Workflow run: `{self.workflow_run_id}`")
         md.append("")
         
         # Severity Badge
@@ -282,6 +284,10 @@ class GraphState(BaseModel):
         default=None,
         description="What the supervisor decided to do next (agent name or FINISH)"
     )
+    failure_counts: dict[str, int] = Field(
+        default_factory=dict,
+        description="Per-run retry counts keyed by workflow step"
+    )
     
     # ── Logging & Debugging 
     messages: Annotated[list[str], operator.add] = Field(
@@ -346,6 +352,4 @@ def get_state_summary(state: GraphState) -> str:
         summary.append(f"   ⚠️ Error: {state.error_message}")
     
     return "\n".join(summary)
-
-
 

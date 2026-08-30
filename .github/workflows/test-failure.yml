@@ -31,9 +31,19 @@ jobs:
   controlled-failure:
     name: "Controlled failure (${{ inputs.failure_type }})"
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Controlled lint failure
         if: inputs.failure_type == 'lint'

@@ -19,7 +19,7 @@ LEAKAGE_COLUMNS = {
     "duration_seconds",
 }
 
-FAILURE_CONCLUSIONS = {"failure", "cancelled", "timed_out", "startup_failure", "action_required"}
+FAILURE_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "action_required"}
 
 
 @dataclass
@@ -123,12 +123,19 @@ def validate_dataset(dataset: str | Path | pd.DataFrame) -> DatasetValidationRep
         return report
 
     report.total_runs = len(frame)
+    binary_labels_valid = False
+    timestamps_valid = False
 
     if "actual_failure" in frame.columns:
-        labels = frame["actual_failure"].fillna(0).astype(int)
-        report.failure_runs = int(labels.sum())
+        labels = pd.to_numeric(frame["actual_failure"], errors="coerce")
+        invalid_labels = labels.isna() | ~labels.isin([0, 1])
+        binary_labels_valid = not bool(invalid_labels.any())
+        report.failure_runs = int((labels == 1).sum())
         report.success_runs = int((labels == 0).sum())
+        report.other_runs = int(invalid_labels.sum())
         report.class_balance_failure_rate = float(report.failure_runs / max(report.total_runs, 1))
+        if not binary_labels_valid:
+            report.warnings.append("actual_failure must contain only non-null binary labels 0 or 1.")
     elif "conclusion" in frame.columns:
         conclusions = frame["conclusion"].astype(str).str.lower()
         report.failure_runs = int(conclusions.isin(FAILURE_CONCLUSIONS).sum())
@@ -140,10 +147,15 @@ def validate_dataset(dataset: str | Path | pd.DataFrame) -> DatasetValidationRep
 
     if "timestamp" in frame.columns:
         timestamps = pd.to_datetime(frame["timestamp"], errors="coerce")
+        timestamps_valid = not bool(timestamps.isna().any())
         valid = timestamps.dropna()
         if not valid.empty:
             report.date_range_start = str(valid.min())
             report.date_range_end = str(valid.max())
+        if not timestamps_valid:
+            report.warnings.append("Dataset contains missing or invalid timestamps.")
+    else:
+        report.warnings.append("Dataset must include a timestamp column.")
 
     if "workflow_name" in frame.columns:
         report.workflows = sorted(frame["workflow_name"].dropna().astype(str).unique().tolist())
@@ -181,8 +193,8 @@ def validate_dataset(dataset: str | Path | pd.DataFrame) -> DatasetValidationRep
             )
 
     if "timestamp" in frame.columns:
-        timestamps = pd.to_datetime(frame["timestamp"], errors="coerce")
-        valid_weeks = timestamps.dropna().dt.to_period("W").astype(str)
+        timestamps = pd.to_datetime(frame["timestamp"], errors="coerce", utc=True)
+        valid_weeks = timestamps.dropna().dt.strftime("%G-W%V")
         if not valid_weeks.empty:
             report.runs_by_week = valid_weeks.value_counts().sort_index().astype(int).to_dict()
 
@@ -194,6 +206,8 @@ def validate_dataset(dataset: str | Path | pd.DataFrame) -> DatasetValidationRep
 
     if "run_id" in frame.columns:
         report.duplicate_run_ids = int(frame["run_id"].duplicated().sum())
+        if report.duplicate_run_ids:
+            report.warnings.append("Duplicate run IDs detected; each workflow run must be unique.")
 
     report.leakage_columns_in_features = sorted(
         LEAKAGE_COLUMNS.intersection(set(FailureFeatureExtractor.feature_columns()))
@@ -211,8 +225,9 @@ def validate_dataset(dataset: str | Path | pd.DataFrame) -> DatasetValidationRep
     if "actual_failure" in frame.columns:
         unique_classes = frame["actual_failure"].dropna().nunique()
 
-    report.sufficient_for_training = report.total_runs >= 20 and unique_classes >= 2
-    report.sufficient_for_evaluation = report.total_runs >= 10 and unique_classes >= 2
+    quality_gate = binary_labels_valid and timestamps_valid and report.duplicate_run_ids == 0
+    report.sufficient_for_training = report.total_runs >= 20 and unique_classes == 2 and quality_gate
+    report.sufficient_for_evaluation = report.total_runs >= 10 and unique_classes == 2 and quality_gate
 
     if report.total_runs < 20:
         report.warnings.append("Fewer than 20 runs — baseline model quality will be weak.")

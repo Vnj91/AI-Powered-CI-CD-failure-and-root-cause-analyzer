@@ -4,13 +4,36 @@ config.py - Project Configuration
 Centralized configuration management for the CI/CD Root Cause Analyzer.
 """
 
-from pathlib import Path
-from typing import Dict, Any
 import os
+from pathlib import Path
+from typing import Any, Dict
+
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+def _configured_path(environment_name: str, default: Path) -> Path:
+    """Resolve a configurable runtime path without depending on the CWD."""
+
+    raw_value = os.getenv(environment_name)
+    if not raw_value:
+        return default
+
+    candidate = Path(raw_value).expanduser()
+    if not candidate.is_absolute():
+        candidate = default.parent / candidate
+    return candidate.resolve()
+
+
+def _configured_int(environment_name: str, default: int, minimum: int = 0) -> int:
+    """Read a bounded integer setting, falling back on malformed input."""
+
+    try:
+        return max(int(os.getenv(environment_name, str(default))), minimum)
+    except (TypeError, ValueError):
+        return max(default, minimum)
+
 
 class Config:
     """Main configuration class."""
@@ -22,9 +45,9 @@ class Config:
     # Directories
     PROJECT_ROOT = Path(__file__).parent
     SRC_DIR = PROJECT_ROOT / "src"
-    DATA_DIR = PROJECT_ROOT / "data"
-    MODELS_DIR = PROJECT_ROOT / "models"
-    OUTPUT_DIR = PROJECT_ROOT / "output"
+    DATA_DIR = _configured_path("DATA_DIR", PROJECT_ROOT / "data")
+    MODELS_DIR = _configured_path("MODELS_DIR", PROJECT_ROOT / "models")
+    OUTPUT_DIR = _configured_path("OUTPUT_DIR", PROJECT_ROOT / "output")
     TESTS_DIR = PROJECT_ROOT / "tests"
 
     # Prediction Artifacts
@@ -43,7 +66,10 @@ class Config:
     
     # AWS Configuration
     AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-    BEDROCK_MODEL_ID = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+    BEDROCK_MODEL_ID = os.getenv(
+        "BEDROCK_MODEL_ID",
+        "anthropic.claude-3-5-sonnet-20240620-v1:0",
+    )
     
     # API Keys
     GITHUB_ACCESS_TOKEN = os.getenv("GITHUB_ACCESS_TOKEN")
@@ -62,7 +88,21 @@ class Config:
     MAX_LOG_LINES = 50000
     
     # Default Repository for Testing
-    DEFAULT_TEST_REPO = "Yasshu55/Test-repo"
+    DEFAULT_TEST_REPO = os.getenv(
+        "DEFAULT_REPOSITORY",
+        "Vnj91/AI-Powered-CI-CD-failure-and-root-cause-analyzer",
+    )
+
+    # Dashboard access controls. APP_PASSWORD should be set for any public
+    # deployment. ALLOWED_REPOSITORIES is a comma-separated allowlist.
+    APP_PASSWORD = os.getenv("APP_PASSWORD")
+    ALLOWED_REPOSITORIES = tuple(
+        repository.strip().lower()
+        for repository in os.getenv("ALLOWED_REPOSITORIES", "").split(",")
+        if repository.strip()
+    )
+    ANALYSIS_COOLDOWN_SECONDS = _configured_int("ANALYSIS_COOLDOWN_SECONDS", 5)
+    MAX_LOG_UPLOAD_BYTES = _configured_int("MAX_LOG_UPLOAD_BYTES", 2 * 1024 * 1024, 1024)
     
     # Logging Configuration
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -87,8 +127,31 @@ class Config:
                 "model_id": cls.BEDROCK_MODEL_ID,
                 "has_github_token": bool(cls.GITHUB_ACCESS_TOKEN),
                 "has_tavily_key": bool(cls.TAVILY_API_KEY),
+                "has_aws_credentials": cls.has_aws_credentials(),
+                "has_app_password": bool(cls.APP_PASSWORD),
+                "allowed_repositories": list(cls.ALLOWED_REPOSITORIES),
             }
         }
+
+    @classmethod
+    def has_aws_credentials(cls) -> bool:
+        """Return whether a locally detectable Bedrock credential source exists."""
+
+        return bool(
+            (os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"))
+            or os.getenv("AWS_PROFILE")
+            or os.getenv("AWS_WEB_IDENTITY_TOKEN_FILE")
+            or os.getenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
+            or os.getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+        )
+
+    @classmethod
+    def repository_is_allowed(cls, repository: str) -> bool:
+        """Enforce the optional deployment repository allowlist."""
+
+        if not cls.ALLOWED_REPOSITORIES:
+            return True
+        return repository.strip().lower() in cls.ALLOWED_REPOSITORIES
     
     @classmethod
     def ensure_directories(cls):
@@ -100,12 +163,8 @@ class Config:
 # Create global config instance
 config = Config()
 
-# Validate on import
+# Make validation available to callers without treating optional integrations
+# as a startup failure for the credential-free dashboard paths.
 validation = config.validate()
-if not validation["valid"]:
-    print("⚠️ Configuration Issues:")
-    for issue in validation["issues"]:
-        print(f"  - {issue}")
-    print("Please check your .env file")
 
 config.ensure_directories()

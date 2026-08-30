@@ -232,16 +232,27 @@ def analyze_culprit_for_repository(
     parsed_error: Optional[ParsedError] = None,
     error_category: Optional[str] = None,
     failed_step: Optional[str] = None,
+    workflow_run_id: Optional[int] = None,
 ) -> CulpritCommitResult:
-    """Fetch failed-run commit context from GitHub and score likely culprit."""
+    """Fetch failed-run commit context from GitHub and score likely culprit.
+
+    When ingestion supplies a run ID, use that exact run so a new failure
+    arriving mid-analysis cannot change the commit being evaluated.
+    """
 
     try:
-        from ..tools.github_loader import get_latest_workflow_run, get_github_client
+        from ..tools.github_loader import get_latest_failed_workflow_run, get_github_client
     except Exception:
         return CulpritCommitResult()
 
     try:
-        latest_run = get_latest_workflow_run(repo_name)
+        client = get_github_client()
+        repo = client.get_repo(repo_name)
+        latest_run = (
+            repo.get_workflow_run(int(workflow_run_id))
+            if workflow_run_id is not None
+            else get_latest_failed_workflow_run(repo_name)
+        )
         if latest_run is None:
             return CulpritCommitResult()
 
@@ -249,8 +260,6 @@ def analyze_culprit_for_repository(
         if not commit_sha:
             return CulpritCommitResult()
 
-        client = get_github_client()
-        repo = client.get_repo(repo_name)
         commit = repo.get_commit(commit_sha)
         changed_files = [item.filename for item in getattr(commit, "files", []) or [] if getattr(item, "filename", None)]
         message = getattr(getattr(commit, "commit", None), "message", "") or ""
@@ -268,4 +277,3 @@ def analyze_culprit_for_repository(
         )
     except Exception:
         return CulpritCommitResult()
-

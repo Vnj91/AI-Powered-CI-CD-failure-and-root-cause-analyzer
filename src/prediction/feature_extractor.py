@@ -189,8 +189,31 @@ class FailureFeatureExtractor:
         if target_column not in dataset.columns:
             raise ValueError(f"Target column '{target_column}' not found in dataset")
 
-        feature_frame = dataset.reindex(columns=cls.feature_columns(), fill_value=0)
-        feature_frame = feature_frame.fillna(0)
+        feature_columns = cls.feature_columns()
+
+        # Collector output contains raw fields such as ``previous_run_status`` and
+        # ``changed_files_json``. Materialize those fields through the same path
+        # used for online inference so training does not silently replace derived
+        # status/extension features with zeroes. Some callers (including legacy
+        # datasets and tests) already store model-ready feature columns, so retain
+        # their explicit non-null values when they are present.
+        raw_source_columns = {"previous_run_status", "changed_files_json"}
+        if raw_source_columns.intersection(dataset.columns):
+            records = dataset.where(pd.notna(dataset), None).to_dict(orient="records")
+            feature_frame = cls.build_feature_frame(records)
+
+            for column in feature_columns:
+                if column not in dataset.columns:
+                    continue
+                explicit_values = pd.to_numeric(dataset[column], errors="coerce")
+                feature_frame[column] = explicit_values.where(
+                    explicit_values.notna(),
+                    feature_frame[column],
+                )
+        else:
+            feature_frame = dataset.reindex(columns=feature_columns, fill_value=0)
+
+        feature_frame = feature_frame.reindex(columns=feature_columns, fill_value=0).fillna(0)
         labels = dataset[target_column].fillna(0).astype(int)
 
         return feature_frame, labels

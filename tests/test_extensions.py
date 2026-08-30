@@ -113,6 +113,22 @@ def test_dataset_validator_warns_on_single_class():
     assert any("one outcome class" in warning for warning in report.warnings)
 
 
+def test_dataset_validator_rejects_non_binary_failure_labels():
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=20, freq="D"),
+            "actual_failure": [0, 1] * 9 + [0, 2],
+            "run_id": list(range(20)),
+        }
+    )
+
+    report = validate_dataset(frame)
+
+    assert report.sufficient_for_training is False
+    assert report.other_runs == 1
+    assert any("binary labels" in warning for warning in report.warnings)
+
+
 def test_feedback_idempotent_by_run_id(tmp_path):
     store = PredictionHistoryStore(tmp_path / "history.csv")
     prediction = FailurePrediction(
@@ -221,11 +237,11 @@ def test_temporal_ordering_uses_run_id_tiebreaker():
     assert list(ordered["run_id"]) == [1, 3, 2]
 
 
-def test_missing_github_token_raises_for_collector():
-    import pytest
+def test_missing_github_token_uses_anonymous_public_client():
+    collector = HistoricalRunCollector(token="")
 
-    with pytest.raises(ValueError, match="GITHUB_ACCESS_TOKEN"):
-        HistoricalRunCollector(token="")
+    assert collector.token is None
+    assert collector.github is not None
 
 
 def test_train_cli_refuses_insufficient_data(tmp_path):

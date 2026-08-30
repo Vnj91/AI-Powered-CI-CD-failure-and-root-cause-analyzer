@@ -29,6 +29,7 @@ from ..tools.log_parser import ParsedError
 from .triage_agent import TriageResult
 
 from ..utils.llm import get_llm
+from ..utils.redaction import redact_sensitive_text
 from ..utils.shared_utils import parse_llm_json_response
 from ..prompts import RESEARCH_SYNTHESIS_PROMPT
 from ..constants import BEDROCK_MODEL_ID
@@ -263,10 +264,10 @@ class ResearchAgent:
         
         # Use triage-provided queries if available
         if triage_result.research_queries:
-            queries.extend(triage_result.research_queries)
+            queries.extend(redact_sensitive_text(query) for query in triage_result.research_queries)
         
         # Always generate basic queries based on error
-        error_short = parsed_error.error_message[:50].replace("'", "").replace('"', '')
+        error_short = redact_sensitive_text(parsed_error.error_message, limit=50).replace("'", "").replace('"', '')
         
         queries.extend([
             f"{parsed_error.error_type} {error_short} fix",
@@ -366,12 +367,12 @@ class ResearchAgent:
         
         if code_context:
             if code_context.requirements:
-                requirements_content = code_context.requirements[:800]
+                requirements_content = redact_sensitive_text(code_context.requirements, limit=800)
             
             if code_context.workflow_files:
                 wf_content = []
                 for wf in code_context.workflow_files[:2]:
-                    content = wf.content[:600].replace('`', "'")  # Replace backticks
+                    content = redact_sensitive_text(wf.content, limit=600).replace('`', "'")
                     wf_content.append(f"File: {wf.path}\n{content}")
                 workflow_content = "\n\n".join(wf_content)
             
@@ -379,9 +380,9 @@ class ResearchAgent:
         
         prompt_vars = {
             "error_type": parsed_error.error_type,
-            "error_message": parsed_error.error_message[:200],
-            "root_cause": triage_result.root_cause,
-            "web_findings": web_findings_text[:3000],  # Limit size
+            "error_message": redact_sensitive_text(parsed_error.error_message, limit=200),
+            "root_cause": redact_sensitive_text(triage_result.root_cause),
+            "web_findings": redact_sensitive_text(web_findings_text, limit=3000),
             "repo_name": self.repo_name or "Not specified",
             "relevant_files": ", ".join(relevant_files) if relevant_files else "None found",
             "requirements_content": requirements_content,
@@ -474,5 +475,4 @@ class ResearchAgent:
         )
         
         return result
-
 

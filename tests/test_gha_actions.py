@@ -10,7 +10,12 @@ import pandas as pd
 import pytest
 
 from config import Config
-from src.prediction.gha_actions import run_pre_ci_prediction, run_workflow_feedback
+from src.prediction.gha_actions import (
+    _prediction_branch,
+    _target_workflow_name,
+    run_pre_ci_prediction,
+    run_workflow_feedback,
+)
 from src.prediction.history_store import PredictionHistoryStore
 from src.prediction.predictor import FailurePredictor
 from src.prediction.schemas import FailurePrediction
@@ -54,6 +59,32 @@ def test_gha_predict_exits_zero_without_model(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(Config, "PREDICTOR_MODEL_PATH", tmp_path / "missing.joblib")
 
     assert run_pre_ci_prediction() == 0
+
+
+def test_prediction_branch_preserves_slash_delimited_head_ref(monkeypatch):
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/feature/risk-dashboard")
+    monkeypatch.delenv("GITHUB_HEAD_REF", raising=False)
+
+    assert _prediction_branch() == "feature/risk-dashboard"
+
+
+def test_prediction_branch_prefers_pull_request_head_ref(monkeypatch):
+    monkeypatch.setenv("GITHUB_REF", "refs/pull/42/merge")
+    monkeypatch.setenv("GITHUB_HEAD_REF", "feature/from-pr")
+
+    assert _prediction_branch() == "feature/from-pr"
+
+
+def test_target_workflow_defaults_to_application_pipeline(monkeypatch):
+    monkeypatch.delenv("TARGET_WORKFLOW_NAME", raising=False)
+
+    assert _target_workflow_name() == "CI/CD Pipeline"
+
+
+def test_target_workflow_supports_explicit_pipeline_name(monkeypatch):
+    monkeypatch.setenv("TARGET_WORKFLOW_NAME", "Release validation")
+
+    assert _target_workflow_name() == "Release validation"
 
 
 def test_gha_predict_exits_zero_with_corrupt_model(monkeypatch, tmp_path: Path):

@@ -1,9 +1,10 @@
 # CI/CD Root Cause Analyzer
 
-This project now has two layers:
+This project has three cooperating layers:
 
 1. CI/CD failure risk prediction before a workflow finishes.
-2. Existing root cause analysis after a failure occurs.
+2. AI-enriched root cause analysis after a failure occurs.
+3. A deployable operations dashboard with credential-free local log triage.
 
 The RCA pipeline is unchanged in spirit: GitHub Actions logs are fetched, parsed, triaged, researched, and synthesized into a debugging brief.
 
@@ -14,7 +15,14 @@ The RCA pipeline is unchanged in spirit: GitHub Actions logs are fetched, parsed
 - Added a baseline Random Forest failure predictor with saved model artifacts.
 - Added an optional failure-category classifier when enough labeled historical failures exist.
 - Added prediction history storage so predictions can be compared with actual outcomes later.
-- Extended the Streamlit UI with a separate failure-risk prediction panel.
+- Rebuilt the Streamlit UI as an operational dashboard for readiness, local and
+  live RCA, risk prediction, dataset/model management, and feedback metrics.
+- Added a deterministic offline analyzer so pasted or uploaded logs can be
+  triaged without GitHub, AWS, or Tavily credentials.
+- Added a hardened single-replica Docker Compose deployment with persistent
+  volumes, health checks, password protection, and a repository allowlist.
+- Fixed latest-failed-run selection, common pytest/ANSI/exit-code parsing,
+  training/inference feature parity, terminal retry state, and secret redaction.
 
 ## Architecture
 
@@ -23,9 +31,8 @@ Developer
     ↓
 Commit / PR
     ↓
-Pre-CI Prediction (.github/workflows/predict.yml + CLI/UI)
-    ↓
 GitHub Actions CI (.github/workflows/ci.yml)
+    ├── Advisory prediction on the real commit SHA
     ├── Lint
     ├── Unit Tests
     ├── Prediction Tests
@@ -101,21 +108,52 @@ python3 -m src.prediction.cli inspect --dataset data/historical_runs.csv
 - Streamlit
 - pandas / numpy / scikit-learn / joblib
 
-## Setup
+## Quick start
 
-1. Copy `.env.example` to `.env`.
-2. Set `GITHUB_ACCESS_TOKEN`, `TAVILY_API_KEY`, and AWS credentials.
-3. Install dependencies:
+The offline dashboard and local log analyzer do not require credentials:
 
 ```bash
-pip install -r requirements.txt
-```
-
-4. Run the UI:
-
-```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
 streamlit run app.py
 ```
+
+Open `http://127.0.0.1:8501`. For live GitHub collection/RCA, copy
+`.env.example` to `.env` and supply the relevant credentials. For model-backed
+risk scores, also collect at least 20 valid two-class runs and train or install
+a trusted model artifact.
+
+For a persistent single-container deployment:
+
+```bash
+cp .env.example .env
+# Set APP_PASSWORD and ALLOWED_REPOSITORIES before public exposure.
+docker compose up -d --build
+curl -fsS http://127.0.0.1:8501/_stcore/health
+```
+
+See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for secrets, IAM/token scope,
+volumes, model installation, hardening, and production acceptance checks.
+
+## Dashboard
+
+The Streamlit dashboard provides:
+
+- runtime/readiness status without revealing secret values;
+- credential-free paste/upload log analysis and report download;
+- GitHub-backed analysis of the most recent failed run, even when a newer run
+  succeeded;
+- pre-CI model prediction that is disabled clearly when no model is installed;
+- historical-data upload/inspection, collection, and training controls;
+- prediction feedback metrics and downloadable history;
+- optional shared-password authentication, exact repository allowlisting, and
+  a cooldown on external operations.
+
+The health endpoint proves only that Streamlit is alive. GitHub RCA additionally
+needs a scoped GitHub token; AI enrichment needs Tavily and AWS Bedrock access;
+prediction needs a trained model under `models/`.
 
 ## Automated CI Training Data Generation
 
@@ -229,7 +267,11 @@ python3 -m src.prediction.cli collect \
 python3 -m src.prediction.cli inspect --dataset data/historical_runs.csv
 ```
 
-The collector gathers **all completed workflows** (CI, pre-CI prediction, controlled failures, etc.).
+The collector includes completed runs with binary conclusions (`success` or
+`failure`) and excludes product-automation workflows such as Prediction Feedback
+and Train Failure Predictor by default. This prevents the
+same commit from gaining contradictory labels merely because support workflows
+also ran.
 
 ### Step 4 — Train only when inspect says sufficient
 
@@ -243,7 +285,8 @@ python3 -m src.prediction.cli evaluate --dataset data/historical_runs.csv
 ### Step 5 — Publish model artifact (GitHub Actions)
 
 Run **Train Failure Predictor** workflow (`train-model.yml`) after enough real history exists.  
-`predict.yml` downloads the artifact for non-blocking pre-CI prediction.
+The non-blocking prediction job in `ci.yml` downloads the newest trusted model
+artifact produced from the default branch.
 
 ### Important
 
@@ -254,7 +297,10 @@ Run **Train Failure Predictor** workflow (`train-model.yml`) after enough real h
 
 ## Collect Historical Data
 
-Requires `GITHUB_ACCESS_TOKEN` with access to the target repository.
+Private repositories and normal API rate limits require `GITHUB_ACCESS_TOKEN`
+with access to the target repository. Public repository metadata can be
+collected anonymously at GitHub's lower unauthenticated rate limit; authenticated
+access is still required to retrieve failed-run log archives and category labels.
 
 ```bash
 python3 -m src.prediction.cli collect owner/repo --output data/historical_runs.csv
@@ -319,6 +365,12 @@ streamlit run app.py
 - `AWS_ACCESS_KEY_ID`
 - `AWS_SECRET_ACCESS_KEY`
 - `AWS_REGION`
+- `BEDROCK_MODEL_ID` (optional model override)
+- `AWS_SESSION_TOKEN` (when temporary credentials are used)
+- `APP_PASSWORD` (recommended for any shared deployment)
+- `ALLOWED_REPOSITORIES` (comma-separated exact `owner/repo` allowlist)
+- `DEFAULT_REPOSITORY`
+- `DATA_DIR`, `MODELS_DIR`, `OUTPUT_DIR` (optional runtime path overrides)
 
 ## Minimum Dataset Guidance
 
@@ -336,14 +388,14 @@ Models are **not** committed to git (`models/*.joblib` is gitignored).
 
 | Workflow | Purpose |
 |----------|---------|
-| `.github/workflows/train-model.yml` | Manual (`workflow_dispatch`) or weekly schedule — collect real history, train, evaluate, upload artifact |
-| `.github/workflows/predict.yml` | Downloads latest `failure-predictor-model` artifact, runs pre-CI prediction (non-blocking), uploads `prediction-history` artifact |
-| `.github/workflows/feedback.yml` | After CI or controlled-failure workflows complete, downloads `prediction-history`, records actual outcomes, re-uploads artifact |
+| `.github/workflows/ci.yml` | Scores the exact commit being tested, stores a run-linked `prediction-snapshot`, runs all checks, publishes the dashboard image on `main` |
+| `.github/workflows/feedback.yml` | After that exact CI run completes, merges its immutable snapshot into the finalized history and records the actual outcome by run ID |
+| `.github/workflows/train-model.yml` | After completed `main` CI/controlled-failure runs, weekly, or manually — collect up to 500 real runs, quality-gate, train, evaluate, and upload auditable artifacts |
 
 Train a model in GitHub Actions:
 
 1. Actions → **Train Failure Predictor** → Run workflow
-2. After success, download artifact from that run or let `predict.yml` consume it automatically
+2. After success, download the artifact or let the next `CI/CD Pipeline` run consume it automatically
 
 Local training still works:
 
@@ -354,28 +406,43 @@ python3 -m src.prediction.cli train --dataset data/historical_runs.csv
 
 ## Pre-CI Prediction in GitHub Actions
 
-Optional workflow: `.github/workflows/predict.yml`
+The experimental `predict-failure-risk` job is part of `.github/workflows/ci.yml`.
+For pull requests it explicitly checks out and scores `pull_request.head.sha`, not
+GitHub's synthetic merge SHA. For pushes it scores `github.sha`. It restores the
+latest model produced on the default branch, calculates risk from that commit's
+real changed files plus prior completed-run history, and writes a job summary.
+Prediction is advisory: a missing/weak model or prediction error does not gate CI.
 
-Runs on `pull_request` and `push` to `main`. It loads the trained model if present, records the prediction to `data/prediction_history.csv`, uploads that file as the `prediction-history` artifact, and prints failure probability **before** the main CI result is known. If no model exists, it skips gracefully and does not block CI.
-
-`feedback.yml` listens for completed **CI/CD Pipeline** and **Controlled CI Failure Generator** runs only (not pre-CI prediction itself), matches pending predictions by commit SHA, and persists outcomes via the same `prediction-history` artifact.
+The CI run uploads an immutable `prediction-snapshot`. `feedback.yml` runs only
+after that same **CI/CD Pipeline** run completes, addresses the prediction by the
+shared run ID, merges out-of-order snapshots under a repository-wide non-cancelling
+concurrency lock, and uploads the cumulative `prediction-history`. This avoids
+duplicate push/PR predictor workflows and commit-SHA matching races.
 
 ## Validation Status (honest)
 
 | Component | Status |
 |-----------|--------|
-| ML pipeline (collect, features, train, predict, feedback) | **IMPLEMENTED** · **TESTED WITH SYNTHETIC DATA** |
-| Dataset validation & leakage guards | **IMPLEMENTED** · **TESTED WITH SYNTHETIC DATA** |
-| GitHub history collection CLI | **IMPLEMENTED** · **TESTED WITH REAL GITHUB DATA** (currently ~1 run in this repo) |
-| Model training on real repo history | **NOT TESTED** (insufficient runs / one outcome class) |
+| ML pipeline (collect, features, train, predict, feedback) | **IMPLEMENTED** · **AUTOMATED TESTS PASS** |
+| Dataset validation, temporal split & leakage guards | **IMPLEMENTED** · **AUTOMATED TESTS PASS** |
+| GitHub history collection CLI | **VALIDATED** · collected 37 real public runs (16 success / 21 failure) |
+| Model training on real repo history | **VALIDATED, EXPERIMENTAL** · chronological 21/16 split; holdout accuracy 12.5%, F1 0.0 |
 | Pre-CI prediction in GitHub Actions | **IMPLEMENTED** · **NOT TESTED LIVE IN GITHUB ACTIONS** |
 | Feedback loop via `prediction-history` artifact | **IMPLEMENTED** · **NOT TESTED LIVE IN GITHUB ACTIONS** |
+| GHCR dashboard image publishing on `main` | **IMPLEMENTED** · **NOT TESTED LIVE IN GITHUB ACTIONS** |
 | LangGraph RCA (Bedrock + Tavily) | **IMPLEMENTED** · **TESTED WITH SYNTHETIC/MOCKED DATA** · **NOT TESTED LIVE** |
-| Culprit commit analyzer | **IMPLEMENTED** · **TESTED WITH SYNTHETIC DATA** |
-| Streamlit UI | **IMPLEMENTED** · **TESTED LOCALLY** (manual) |
-| Controlled failure workflow | **IMPLEMENTED** · **NOT TESTED LIVE IN GITHUB ACTIONS** |
+| Culprit commit analyzer | **IMPLEMENTED** · **AUTOMATED TESTS PASS** |
+| Offline log RCA | **IMPLEMENTED** · **AUTOMATED TESTS PASS** |
+| Streamlit dashboard | **IMPLEMENTED** · **APPTEST + LOCAL HEALTH + BROWSER JOURNEY PASS** |
+| Docker/Compose deployment | **IMPLEMENTED** · **STATICALLY VALIDATED** · **RUNTIME REQUIRES DOCKER** |
+| Controlled failure workflow | **IMPLEMENTED** · 17 completed runs observed in upstream history |
 
-Unit tests do **not** prove production readiness. Live validation requires pushing workflows, generating ≥20 varied CI runs, training a model artifact, and observing predict + feedback on real Actions runs.
+Local verification currently passes `ruff`, `compileall`, `pip-audit`, and all
+104 tests. The locally generated real-history CSV and model artifacts are
+gitignored runtime state, not source-controlled release assets.
+Unit tests do **not** prove production readiness. Live validation requires valid
+runtime credentials, ≥20 varied two-class CI runs, a trusted trained model, and
+an observed prediction/feedback/RCA cycle against real GitHub Actions.
 
 ## Limitations
 
@@ -383,9 +450,17 @@ Unit tests do **not** prove production readiness. Live validation requires pushi
 - Predictions depend on historical run metadata that may be incomplete in some repositories.
 - The model does not replace the existing LLM-based RCA path.
 - The app does not fabricate confidence where the model does not support it.
-- **Real GitHub credentials are required** to collect history and score live commits.
+- Public workflow metadata can be collected anonymously with low rate limits;
+  private repositories, dashboard-backed live GitHub operations, failed-run log
+  archives, and category labeling require a scoped GitHub token.
 - Baseline Random Forest quality depends on dataset size; below ~50 runs expect weak signal.
+- The current 37-run local model is explicitly marked experimental because its
+  chronological holdout scored 12.5% accuracy and F1 0.0; it must not gate releases.
 - Culprit commit analysis uses deterministic evidence; it does not replace git bisect or human review.
+- Runtime CSV storage is protected within one process only; use exactly one
+  application replica with persistent `data/`, `models/`, and `output/` mounts.
+- Public deployment must add TLS/network controls and set both `APP_PASSWORD`
+  and `ALLOWED_REPOSITORIES`; the built-in password is a shared gate, not SSO.
 
 ## Notes
 
@@ -397,6 +472,7 @@ This repository uses a multi-stage GitHub Actions pipeline at [`.github/workflow
 
 ```
 Code Checkout
+    ├── Advisory Real-Commit Prediction
     ↓
 Lint / Static Checks
     ↓
@@ -408,20 +484,25 @@ Build / App Validation ──┐
                          ├──→ Docker Build & Validate
 Security Check ──────────┘
     ↓ (main branch pushes only)
-Release Artifact
+GHCR Image + Release Artifact
 ```
 
 | Job | Purpose | Typical failure category |
 |-----|---------|--------------------------|
+| `predict-failure-risk` | Score the exact PR head/push commit and upload a run-linked snapshot; explicitly non-gating | Advisory only |
 | `lint` | `ruff` + `compileall` | Code quality / syntax |
 | `unit-tests` | Full `pytest -q` suite with coverage | Test failure |
 | `prediction-tests` | ML import, feature extraction, train/load/predict/evaluate via test fixtures | ML / prediction failure |
 | `build` | Compile sources and import modules without live API credentials | Application / build failure |
 | `security` | `pip-audit` on installed dependencies | Dependency / security failure |
 | `docker-build` | Build image and verify Streamlit health endpoint | Container / build failure |
-| `release-artifact` | Package a deployment bundle on `main` (simulated release, no cloud deploy) | Release packaging failure |
+| `container-publish` | Publish lowercase `ghcr.io/<owner>/<repo>` tags `latest` and immutable `sha-<12>` on `main` | Container publishing failure |
+| `release-artifact` | Package a self-hostable deployment bundle on `main` (no managed-cloud rollout) | Release packaging failure |
 
-The pipeline does **not** require AWS, Bedrock, Tavily, or GitHub tokens for ordinary CI runs. Tests use mocked fixtures already present in `tests/test_prediction.py`.
+The pipeline does **not** require AWS, Bedrock, Tavily, or a separately created
+GitHub secret. Prediction/history access and GHCR publishing use GitHub's
+short-lived workflow token with job-scoped `actions: read` or `packages: write`
+permissions. Tests use mocked fixtures already present in `tests/test_prediction.py`.
 
 Run CI-like checks locally:
 
@@ -437,6 +518,7 @@ curl -f http://127.0.0.1:8501/_stcore/health
 docker stop cicd-test
 ```
 
+For the supported persistent deployment and security requirements, use
+`docker compose up -d --build` and follow [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
 To build historical CI/CD data for the failure predictor, run this workflow on real pull requests and merges to `main`. Do not fabricate workflow outcomes — introduce controlled, real failures by temporarily breaking the relevant stage (for example, a lint violation, a failing assertion, or an outdated dependency) and reverting after the run is recorded.
-
-

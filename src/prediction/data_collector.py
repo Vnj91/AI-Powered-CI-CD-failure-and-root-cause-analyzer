@@ -6,7 +6,7 @@ import io
 import json
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Optional
 import zipfile
@@ -25,10 +25,15 @@ from .schemas import WorkflowRunRecord
 
 FAILURE_CONCLUSIONS = {
     "failure",
-    "cancelled",
     "timed_out",
     "startup_failure",
     "action_required",
+}
+SUCCESS_CONCLUSIONS = {"success"}
+SYSTEM_WORKFLOW_NAMES = {
+    "pre-ci failure prediction",
+    "prediction feedback",
+    "train failure predictor",
 }
 
 
@@ -49,10 +54,8 @@ class HistoricalRunCollector:
     def __init__(self, token: Optional[str] = None, recent_window: int = 10):
         self.token = token or GITHUB_ACCESS_TOKEN
         self.recent_window = recent_window
-        if not self.token:
-            raise ValueError("GITHUB_ACCESS_TOKEN is required to collect GitHub Actions history")
-
-        self.github = Github(auth=Auth.Token(self.token))
+        self.github = Github(auth=Auth.Token(self.token)) if self.token else Github()
+        self._file_feature_cache: dict[str, dict[str, object]] = {}
 
     def _repo(self, repository: str):
         try:
@@ -65,6 +68,25 @@ class HistoricalRunCollector:
         if not conclusion:
             return 0
         return int(conclusion.lower() in FAILURE_CONCLUSIONS)
+
+    @staticmethod
+    def _workflow_name(run: WorkflowRun) -> str:
+        return str(
+            getattr(getattr(run, "workflow", None), "name", None)
+            or getattr(run, "name", None)
+            or "unknown"
+        )
+
+    @classmethod
+    def _is_trainable_run(cls, run: WorkflowRun, *, include_system_workflows: bool = False) -> bool:
+        """Keep only definitive target outcomes used by the risk model."""
+
+        conclusion = str(getattr(run, "conclusion", None) or "").lower()
+        if conclusion not in FAILURE_CONCLUSIONS | SUCCESS_CONCLUSIONS:
+            return False
+        if include_system_workflows:
+            return True
+        return cls._workflow_name(run).strip().lower() not in SYSTEM_WORKFLOW_NAMES
 
     @staticmethod
     def _safe_int(value) -> int:
@@ -91,6 +113,10 @@ class HistoricalRunCollector:
         )
 
     def _compute_file_features(self, repo, run: WorkflowRun) -> dict[str, object]:
+        commit_sha = str(getattr(run, "head_sha", "") or "")
+        if commit_sha and commit_sha in self._file_feature_cache:
+            return dict(self._file_feature_cache[commit_sha])
+
         changed_files: list[str] = []
         files_changed = 0
         lines_added = 0
@@ -105,18 +131,10 @@ class HistoricalRunCollector:
             lines_added = self._safe_int(getattr(commit.stats, "additions", 0))
             lines_deleted = self._safe_int(getattr(commit.stats, "deletions", 0))
 
-            parents = list(getattr(commit, "parents", []) or [])
-            if parents:
-                try:
-                    comparison = repo.compare(parents[0].sha, run.head_sha)
-                    number_of_commits = self._safe_int(getattr(comparison, "total_commits", 1))
-                    if not changed_files:
-                        changed_files = [file.filename for file in getattr(comparison, "files", []) or [] if getattr(file, "filename", None)]
-                        files_changed = len(changed_files)
-                except Exception:
-                    number_of_commits = max(1, len(parents))
-            else:
-                number_of_commits = 1
+            # A workflow run is tied to one head commit. The commit endpoint
+            # already returns its changed files and stats, so a second compare
+            # request adds cost without changing this per-run feature.
+            number_of_commits = 1
         except Exception:
             pass
 
@@ -139,7 +157,7 @@ class HistoricalRunCollector:
             extension = FailureFeatureExtractor._extension_for_path(path)
             changed_extensions[extension] += 1
 
-        return {
+        features = {
             "files_changed": files_changed,
             "lines_added": lines_added,
             "lines_deleted": lines_deleted,
@@ -152,6 +170,9 @@ class HistoricalRunCollector:
             "test_files_changed": test_files_changed,
             "infrastructure_files_changed": infrastructure_files_changed,
         }
+        if commit_sha:
+            self._file_feature_cache[commit_sha] = dict(features)
+        return features
 
     def _compute_history_features(self, state: _HistoryState, branch: str, workflow: str) -> dict[str, object]:
         recent_failure_count = sum(state.recent_outcomes)
@@ -190,6 +211,11 @@ class HistoricalRunCollector:
         """Best-effort label extraction from failed workflow logs."""
 
         if not self._is_failure(getattr(run, "conclusion", None)):
+            return None
+        if not self.token:
+            # Public metadata collection works anonymously, but Actions log
+            # archives require authenticated access. Category labels remain
+            # optional for the binary failure model.
             return None
 
         logs_url = getattr(run, "logs_url", None)
@@ -230,11 +256,16 @@ class HistoricalRunCollector:
         repository: str,
         limit: Optional[int] = None,
         status: str = "completed",
+        include_system_workflows: bool = False,
     ) -> pd.DataFrame:
         """Collect historical workflow runs as a leakage-safe dataset."""
 
         repo = self._repo(repository)
-        runs = self._sort_runs_by_time(list(repo.get_workflow_runs(status=status)))
+        runs = [
+            run
+            for run in self._sort_runs_by_time(list(repo.get_workflow_runs(status=status)))
+            if self._is_trainable_run(run, include_system_workflows=include_system_workflows)
+        ]
 
         if limit is not None:
             runs = runs[-limit:]
@@ -251,7 +282,7 @@ class HistoricalRunCollector:
 
         for run in runs:
             branch = str(getattr(run, "head_branch", "unknown") or "unknown")
-            workflow_name = str(getattr(getattr(run, "workflow", None), "name", None) or getattr(run, "name", None) or "unknown")
+            workflow_name = self._workflow_name(run)
 
             file_features = self._compute_file_features(repo, run)
             history_features = self._compute_history_features(history, branch, workflow_name)
@@ -266,7 +297,7 @@ class HistoricalRunCollector:
                 run_number=self._safe_int(getattr(run, "run_number", None)),
                 branch=branch,
                 commit_sha=str(getattr(run, "head_sha", None) or ""),
-                timestamp=getattr(run, "created_at", datetime.utcnow()) or datetime.utcnow(),
+                timestamp=getattr(run, "created_at", datetime.now(UTC)) or datetime.now(UTC),
                 status=str(getattr(run, "status", None) or ""),
                 conclusion=str(getattr(run, "conclusion", None) or ""),
                 duration_seconds=self._duration_seconds(run),
@@ -311,7 +342,11 @@ class HistoricalRunCollector:
         branch_name = branch or "unknown"
         workflow_filter = workflow_name or "unknown"
 
-        recent_runs = self._sort_runs_by_time(list(repo.get_workflow_runs(status="completed")))
+        recent_runs = [
+            run
+            for run in self._sort_runs_by_time(list(repo.get_workflow_runs(status="completed")))
+            if self._is_trainable_run(run)
+        ]
 
         history = _HistoryState(
             recent_outcomes=deque(maxlen=self.recent_window),
@@ -323,7 +358,7 @@ class HistoricalRunCollector:
 
         for run in recent_runs:
             run_branch = str(getattr(run, "head_branch", "unknown") or "unknown")
-            run_workflow = str(getattr(getattr(run, "workflow", None), "name", None) or getattr(run, "name", None) or "unknown")
+            run_workflow = self._workflow_name(run)
             if getattr(run, "head_sha", None) == commit_sha:
                 break
 
@@ -350,7 +385,7 @@ class HistoricalRunCollector:
             "run_number": None,
             "branch": branch_name,
             "commit_sha": commit_sha,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "status": "in_progress",
             "conclusion": None,
             "duration_seconds": None,
@@ -369,12 +404,18 @@ class HistoricalRunCollector:
         output_path: str | Path,
         limit: Optional[int] = None,
         status: str = "completed",
+        include_system_workflows: bool = False,
     ) -> Path:
         """Collect a repository's workflow history into a CSV dataset."""
 
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        frame = self.collect_repository_runs(repository=repository, limit=limit, status=status)
+        frame = self.collect_repository_runs(
+            repository=repository,
+            limit=limit,
+            status=status,
+            include_system_workflows=include_system_workflows,
+        )
         frame.to_csv(output_path, index=False)
         return output_path

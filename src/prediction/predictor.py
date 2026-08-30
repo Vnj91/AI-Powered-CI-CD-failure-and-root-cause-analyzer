@@ -133,6 +133,18 @@ class FailurePredictor:
         predicted_failure = bool(proba >= 0.5)
         feature_importances = self._feature_importances()
         predicted_category, category_confidence = self._predict_category(frame)
+        warnings: list[str] = []
+        metrics = self.artifact.get("metrics", {}) if self.artifact else {}
+        test_rows = int(metrics.get("test_rows", 0) or 0)
+        f1 = float(metrics.get("f1", 0.0) or 0.0)
+        if test_rows < 20:
+            warnings.append(
+                f"Experimental baseline: the chronological holdout contains only {test_rows} runs."
+            )
+        if f1 < 0.5:
+            warnings.append(
+                f"Weak holdout quality (F1 {f1:.1%}); treat this score as directional, not a release gate."
+            )
 
         importance_rows: list[FeatureImportance] = []
         for index, feature_name in enumerate(self.feature_columns):
@@ -164,4 +176,5 @@ class FailurePredictor:
             top_risk_factors=top_risk_factors,
             feature_importances=importance_rows,
             model_version=self.model_version,
+            warnings=warnings,
         )

@@ -3,11 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
+import pytest
 
 from src.prediction import (
     FailureFeatureExtractor,
+    FailurePrediction,
     FailurePredictor,
     FailurePredictorTrainer,
     FailurePredictionService,
@@ -88,10 +91,60 @@ def test_feature_extraction_handles_missing_values():
     assert feature_row["changed_ext_py_count"] == 0
 
 
+def test_prepare_training_frame_materializes_collector_shaped_rows():
+    dataset = pd.DataFrame(
+        [
+            {
+                "actual_failure": 1,
+                "previous_run_status": "failure",
+                "changed_files_json": '["src/main.py", ".github/workflows/ci.yml", "Dockerfile"]',
+                "files_changed": 3,
+                "lines_added": 12,
+                "lines_deleted": 4,
+                "dependency_files_changed": False,
+                "ci_workflow_files_changed": True,
+                "docker_files_changed": True,
+            }
+        ]
+    )
+
+    features, labels = FailureFeatureExtractor.prepare_training_frame(dataset)
+
+    assert list(features.columns) == FailureFeatureExtractor.feature_columns()
+    assert features.loc[0, "previous_run_status_failure"] == 1
+    assert features.loc[0, "previous_run_status_success"] == 0
+    assert features.loc[0, "changed_ext_py_count"] == 1
+    assert features.loc[0, "changed_ext_yml_count"] == 1
+    assert features.loc[0, "changed_ext_dockerfile_count"] == 1
+    assert features.loc[0, "changed_extension_diversity"] == 3
+    assert labels.tolist() == [1]
+
+
+def test_prepare_training_frame_preserves_explicit_derived_features():
+    dataset = pd.DataFrame(
+        [
+            {
+                "actual_failure": 0,
+                "previous_run_status": "failure",
+                "changed_files_json": '["src/main.py"]',
+                "previous_run_status_failure": 0,
+                "previous_run_status_success": 1,
+                "changed_ext_py_count": 7,
+                "changed_extension_diversity": 9,
+            }
+        ]
+    )
+
+    features, _ = FailureFeatureExtractor.prepare_training_frame(dataset)
+
+    assert features.loc[0, "previous_run_status_failure"] == 0
+    assert features.loc[0, "previous_run_status_success"] == 1
+    assert features.loc[0, "changed_ext_py_count"] == 7
+    assert features.loc[0, "changed_extension_diversity"] == 9
+
+
 def test_history_store_appends_and_updates(tmp_path: Path):
     store = PredictionHistoryStore(tmp_path / "prediction_history.csv")
-
-    from src.prediction.schemas import FailurePrediction
 
     prediction = FailurePrediction(
         model_available=True,
@@ -115,6 +168,55 @@ def test_history_store_appends_and_updates(tmp_path: Path):
     frame = pd.read_csv(tmp_path / "prediction_history.csv")
     assert len(frame) == 1
     assert int(frame.loc[0, "actual_failure"]) == 1
+
+
+def test_history_store_preserves_concurrent_predictions(tmp_path: Path):
+    history_path = tmp_path / "prediction_history.csv"
+    prediction = FailurePrediction(
+        model_available=True,
+        failure_probability=0.6,
+        predicted_failure=True,
+        risk_level="MEDIUM",
+        model_version="concurrency-test",
+    )
+
+    def append(index: int) -> str:
+        store = PredictionHistoryStore(history_path)
+        return store.append_prediction(
+            repository="owner/repo",
+            workflow="CI/CD Pipeline",
+            run_id=index,
+            commit_sha=f"sha-{index}",
+            prediction=prediction,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        prediction_ids = list(executor.map(append, range(24)))
+
+    frame = pd.read_csv(history_path)
+    assert len(frame) == 24
+    assert frame["run_id"].nunique() == 24
+    assert len(set(prediction_ids)) == 24
+
+
+def test_prediction_service_does_not_record_when_model_is_unavailable(tmp_path: Path):
+    history_path = tmp_path / "prediction_history.csv"
+    service = FailurePredictionService(
+        model_path=tmp_path / "missing_model.joblib",
+        history_path=history_path,
+    )
+
+    prediction, prediction_id = service.predict_and_record(
+        repository="owner/repo",
+        workflow="CI/CD Pipeline",
+        run_id=123,
+        commit_sha="abc123",
+        features={"files_changed": 1, "changed_files_json": '["src/main.py"]'},
+    )
+
+    assert prediction.model_available is False
+    assert prediction_id is None
+    assert not history_path.exists()
 
 
 def test_trainer_predictor_and_evaluator_round_trip(tmp_path: Path):
@@ -148,6 +250,39 @@ def test_trainer_predictor_and_evaluator_round_trip(tmp_path: Path):
     assert 0.0 <= metrics.accuracy <= 1.0
 
 
+def test_trainer_rejects_one_class_temporal_training_prefix(tmp_path: Path):
+    dataset = make_training_dataset(rows=20)
+    dataset["actual_failure"] = [0] * 16 + [1] * 4
+    dataset_path = tmp_path / "historical_runs.csv"
+    model_path = tmp_path / "failure_predictor.joblib"
+    dataset.to_csv(dataset_path, index=False)
+
+    with pytest.raises(ValueError, match="Temporal training split must contain at least two classes"):
+        FailurePredictorTrainer(random_state=13).train(dataset_path, model_path)
+
+    assert not model_path.exists()
+
+
+def test_trainer_moves_temporal_split_to_keep_both_holdout_classes():
+    labels = pd.Series([0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 1, 1])
+
+    split_index = FailurePredictorTrainer._select_temporal_split(labels, test_fraction=0.2)
+
+    assert split_index == 6
+    assert set(labels.iloc[:split_index]) == {0, 1}
+    assert set(labels.iloc[split_index:]) == {0, 1}
+
+
+def test_trainer_rejects_non_binary_target_values(tmp_path: Path):
+    dataset = make_training_dataset(rows=20)
+    dataset.loc[dataset.index[-1], "actual_failure"] = 2
+    dataset_path = tmp_path / "historical_runs.csv"
+    dataset.to_csv(dataset_path, index=False)
+
+    with pytest.raises(ValueError, match="binary labels 0 and 1"):
+        FailurePredictorTrainer().train(dataset_path, tmp_path / "model.joblib")
+
+
 def test_category_model_trains_and_predicts(tmp_path: Path):
     dataset = make_category_training_dataset()
     dataset_path = tmp_path / "historical_runs.csv"
@@ -168,6 +303,32 @@ def test_category_model_trains_and_predicts(tmp_path: Path):
 
     assert prediction.predicted_category in {"dependency", "build", "test"}
     assert prediction.category_confidence is not None
+
+
+def test_category_model_skips_when_temporal_prefix_lacks_a_category(tmp_path: Path):
+    dataset = make_category_training_dataset(rows=40)
+    failure_indices = dataset.index[dataset["actual_failure"] == 1].tolist()
+    dataset.loc[failure_indices[:8], "actual_category"] = "dependency"
+    dataset.loc[failure_indices[8:16], "actual_category"] = "build"
+    dataset.loc[failure_indices[16:], "actual_category"] = "test"
+
+    dataset_path = tmp_path / "historical_runs.csv"
+    model_path = tmp_path / "failure_predictor.joblib"
+    metadata_path = tmp_path / "failure_predictor_metadata.json"
+    dataset.to_csv(dataset_path, index=False)
+
+    artifact = FailurePredictorTrainer(random_state=17).train(
+        dataset_path,
+        model_path,
+        metadata_path,
+    )
+
+    category_artifact = artifact["category_artifact"]
+    assert category_artifact["trained"] is False
+    assert category_artifact["missing_categories"] == ["test"]
+    assert "Temporal category training split" in category_artifact["reason"]
+    assert model_path.exists()
+    assert not (tmp_path / "failure_category_predictor.joblib").exists()
 
 
 def test_collector_builds_prediction_features_from_fakes(monkeypatch):

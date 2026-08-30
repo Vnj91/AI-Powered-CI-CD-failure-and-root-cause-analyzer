@@ -21,6 +21,7 @@ from langchain_aws import ChatBedrock
 
 from ..tools.log_parser import ParsedError, ErrorCategory
 from ..utils.llm import get_llm
+from ..utils.redaction import redact_sensitive_text
 from ..prompts import TRIAGE_SYSTEM_PROMPT, TRIAGE_USER_PROMPT
 from ..constants import BEDROCK_MODEL_ID
 
@@ -134,12 +135,17 @@ class TriageAgent:
         
         return {
             "error_type": error.error_type,
-            "error_message": error.error_message,
+            "error_message": redact_sensitive_text(error.error_message),
             "error_category": error.error_category.value if error.error_category else "unknown",
-            "failed_step": error.failed_step or "Unknown",
+            "failed_step": redact_sensitive_text(error.failed_step or "Unknown"),
             "exit_code": error.exit_code or "Unknown",
-            "stack_trace": "\n".join(error.stack_trace) if error.stack_trace else "No stack trace available",
-            "raw_error_block": error.raw_error_block[:2000] if error.raw_error_block else "No additional context"
+            "stack_trace": redact_sensitive_text(
+                "\n".join(error.stack_trace) if error.stack_trace else "No stack trace available"
+            ),
+            "raw_error_block": redact_sensitive_text(
+                error.raw_error_block if error.raw_error_block else "No additional context",
+                limit=2000,
+            ),
         }
     
     def _parse_llm_response(self, response_text: str) -> TriageResult:
@@ -201,6 +207,5 @@ class TriageAgent:
         result = self._parse_llm_response(response.content)
         
         return result
-
 
 
