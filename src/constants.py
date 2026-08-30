@@ -4,20 +4,17 @@ constants.py - Shared Constants for CI/CD Root Cause Analyzer
 Centralized configuration to eliminate duplication across modules.
 """
 
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
+from config import Config
 
 # AWS/Bedrock Configuration
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-BEDROCK_MODEL_ID = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+AWS_REGION = Config.AWS_REGION
+BEDROCK_MODEL_ID = Config.BEDROCK_MODEL_ID
 
 # GitHub Configuration  
-GITHUB_ACCESS_TOKEN = os.getenv("GITHUB_ACCESS_TOKEN")
+GITHUB_ACCESS_TOKEN = Config.GITHUB_ACCESS_TOKEN
 
 # Tavily Configuration
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+TAVILY_API_KEY = Config.TAVILY_API_KEY
 
 # Rate Limiting
 DELAY_BETWEEN_LLM_CALLS = 3  # seconds

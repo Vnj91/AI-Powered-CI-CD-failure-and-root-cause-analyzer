@@ -17,8 +17,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.graph.workflow import run_analysis
+from src.graph.workflow import run_enriched_analysis
 from src.graph.state import GraphState, WorkflowPhase
+from src.integrations.github_automation import GitHubAutomationService
+from config import Config
 
 
 def analyze_repository(repo_name: str, output_dir: str = "output") -> GraphState:
@@ -35,7 +37,18 @@ def analyze_repository(repo_name: str, output_dir: str = "output") -> GraphState
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True)
     
-    final_state = run_analysis(repo_name)
+    automation = GitHubAutomationService(repository=repo_name)
+    context = automation.latest_failed_run_context(repo_name, include_logs=True)
+    if context.run is None:
+        raise RuntimeError("No failed GitHub Actions run was found for this repository.")
+    if context.logs is None or not context.logs.combined_text.strip():
+        raise RuntimeError(context.logs_error or "GitHub returned no readable workflow logs.")
+    final_state = run_enriched_analysis(
+        repo_name,
+        context.logs.combined_text,
+        workflow_run_id=context.run.id,
+        github_token=Config.GITHUB_ACCESS_TOKEN,
+    )
     
     if final_state.debugging_brief:
         brief = final_state.debugging_brief

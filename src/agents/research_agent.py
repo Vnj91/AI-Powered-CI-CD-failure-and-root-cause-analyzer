@@ -20,7 +20,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
-from langchain_aws import ChatBedrock
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 
 from ..tools.tavily_search import TavilySearchTool, SearchResponse
@@ -34,6 +34,7 @@ from ..utils.shared_utils import parse_llm_json_response
 from ..prompts import RESEARCH_SYNTHESIS_PROMPT
 from ..constants import BEDROCK_MODEL_ID
 from ..utils.shared_utils import extract_json_from_text
+from config import Config
 
 
 class SolutionCandidate(BaseModel):
@@ -221,7 +222,8 @@ class ResearchAgent:
     def __init__(
         self,
         repo_name: Optional[str] = None,
-        model_id: str = BEDROCK_MODEL_ID
+        model_id: str = BEDROCK_MODEL_ID,
+        github_token: Optional[str] = None,
     ):
         """
         Initialize the Research Agent.
@@ -233,11 +235,11 @@ class ResearchAgent:
         self.repo_name = repo_name
         self.model_id = model_id
         
-        self.search_tool = TavilySearchTool()
+        self.search_tool = TavilySearchTool(api_key=Config.TAVILY_API_KEY) if Config.TAVILY_API_KEY else None
         self.code_fetcher = None
         if repo_name:
             try:
-                self.code_fetcher = CodeContextFetcher(repo_name)
+                self.code_fetcher = CodeContextFetcher(repo_name, token=github_token)
             except Exception as e:
                 print(f"Could not connect to repo: {e}")
         
@@ -246,8 +248,7 @@ class ResearchAgent:
             ("human", RESEARCH_SYNTHESIS_PROMPT)
         ])
     
-    def _create_llm(self) -> ChatBedrock:
-        print(f"Using shared Claude instance")
+    def _create_llm(self) -> BaseChatModel:
         return get_llm()
     
     def _generate_search_queries(
@@ -302,6 +303,9 @@ class ResearchAgent:
         Returns:
             List of SearchResponse objects
         """
+        if self.search_tool is None:
+            return []
+
         print("\nPerforming Web Research...")
         print("-" * 40)
         
@@ -475,4 +479,3 @@ class ResearchAgent:
         )
         
         return result
-

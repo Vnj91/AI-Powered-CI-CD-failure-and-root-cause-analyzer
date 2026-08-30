@@ -19,6 +19,7 @@ from src.integrations.github_automation import (
     GitHubWorkflowLogBundle,
     GitHubWorkflowLogFile,
     GitHubWorkflowRunSummary,
+    GitHubWorkflowSummary,
 )
 from src.prediction.schemas import FailurePrediction, FeatureImportance
 
@@ -36,6 +37,7 @@ def _isolate_runtime(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(Config, "CATEGORY_METADATA_PATH", tmp_path / "failure_category_predictor_metadata.json")
     monkeypatch.setattr(Config, "ANALYSIS_COOLDOWN_SECONDS", 0)
     monkeypatch.setattr(Config, "GITHUB_ACCESS_TOKEN", None)
+    monkeypatch.setattr(Config, "LLM_PROVIDER", "none")
     monkeypatch.setattr(Config, "APP_PASSWORD", None)
 
 
@@ -120,6 +122,16 @@ class FakeGitHubAutomationService:
 
     def get_workflow_runs(self, repository=None, limit=20, status=None):
         return [_sample_run()]
+
+    def get_workflows(self, repository=None, limit=100):
+        return [
+            GitHubWorkflowSummary(
+                id=1,
+                name="CI/CD Pipeline",
+                path=".github/workflows/ci.yml",
+                state="active",
+            )
+        ]
 
     def predict_latest_change(
         self,
@@ -309,6 +321,18 @@ def test_dashboard_cold_start_without_secrets_or_model(monkeypatch, tmp_path):
     assert _button(app, "github_predict_latest").disabled
     assert _button(app, "github_analyze_latest_failure").disabled
     assert _button(app, "github_sync_history").disabled
+
+
+def test_sidebar_automation_navigation_is_functional(monkeypatch, tmp_path):
+    _isolate_runtime(monkeypatch, tmp_path)
+    _patch_github_service(monkeypatch)
+    app = AppTest.from_file(str(APP_PATH), default_timeout=30).run()
+
+    _button(app, "open_automation_setup").click()
+    app.run()
+
+    assert not app.exception
+    assert app.session_state["dashboard_tab"] == "Automation"
 
 
 def test_dashboard_analyzes_a_pasted_log_as_advanced_fallback(monkeypatch, tmp_path):
@@ -585,6 +609,7 @@ def test_ai_enriched_rca_button_uses_configured_backend(monkeypatch, tmp_path):
     _patch_github_service(monkeypatch)
     monkeypatch.setattr(Config, "GITHUB_ACCESS_TOKEN", "deployment-token")
     monkeypatch.setattr(Config, "TAVILY_API_KEY", "tavily-key")
+    monkeypatch.setattr(Config, "LLM_PROVIDER", "bedrock")
     monkeypatch.setattr(Config, "has_aws_credentials", classmethod(lambda cls: True))
 
     from src.analysis import build_local_debugging_brief
@@ -595,8 +620,11 @@ def test_ai_enriched_rca_button_uses_configured_backend(monkeypatch, tmp_path):
     brief = build_local_debugging_brief(parsed.primary_error, REPOSITORY)
     monkeypatch.setattr(
         graph_workflow,
-        "run_analysis",
-        lambda repository: SimpleNamespace(debugging_brief=brief, error_message=None),
+        "run_enriched_analysis",
+        lambda repository, log_content, workflow_run_id=None, github_token=None: SimpleNamespace(
+            debugging_brief=brief,
+            error_message=None,
+        ),
     )
     app = AppTest.from_file(str(APP_PATH), default_timeout=30).run()
     _radio(app, "Analysis source").set_value("AI-enriched GitHub RCA")

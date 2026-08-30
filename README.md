@@ -3,10 +3,13 @@
 This project has three cooperating layers:
 
 1. CI/CD failure risk prediction before a workflow finishes.
-2. AI-enriched root cause analysis after a failure occurs.
+2. Deterministic root cause analysis, with optional provider-backed enrichment.
 3. A deployable operations dashboard with credential-free local log triage.
 
-The RCA pipeline is unchanged in spirit: GitHub Actions logs are fetched, parsed, triaged, researched, and synthesized into a debugging brief.
+The dashboard fetches bounded, redacted GitHub Actions logs directly. Its
+deterministic RCA works without an LLM; an opt-in provider layer can enrich the
+brief with AWS Bedrock or a locally hosted Ollama model, with Tavily as optional
+web research.
 
 ## What Changed
 
@@ -23,6 +26,8 @@ The RCA pipeline is unchanged in spirit: GitHub Actions logs are fetched, parsed
   volumes, health checks, password protection, and a repository allowlist.
 - Fixed latest-failed-run selection, common pytest/ANSI/exit-code parsing,
   training/inference feature parity, terminal retry state, and secret redaction.
+- Added real workflow discovery, session-only GitHub authentication, and
+  provider-neutral Bedrock/Ollama/no-LLM runtime status.
 
 ## Architecture
 
@@ -44,11 +49,13 @@ Workflow Result
     ↓
 Prediction Feedback (prediction_history.csv)
     ↓
-If failure → RCA (LangGraph)
-    ├── Triage (LLM)
-    ├── Research (LLM + Tavily)
-    ├── Root Cause + Fixes (LLM)
-    └── Likely Culprit Commit (deterministic)
+If failure → deterministic local RCA (always available)
+    ├── Parse/classify logs
+    ├── Root Cause + Fixes
+    └── Likely Culprit Commit (evidence-based)
+Optional enrichment (explicitly configured)
+    ├── Bedrock or Ollama triage/synthesis
+    └── Tavily web research (optional)
     ↓
 Historical Dataset (data/historical_runs.csv)
     ↓
@@ -81,8 +88,9 @@ Commit / PR → predict risk → CI runs → record actual outcome → if failed
 ### RCA layer (unchanged core)
 - `src/graph/workflow.py` — LangGraph supervisor workflow
 - `src/agents/` — triage, research, synthesis
-- `src/tools/log_parser.py`, `src/tools/github_loader.py`
+- `src/tools/log_parser.py`, `src/integrations/github_automation.py`
 - `src/tools/commit_analyzer.py` — likely culprit commit scoring
+- `src/utils/llm.py` — optional Bedrock/Ollama/no-LLM provider boundary
 
 ## Data Safety / Leakage Prevention
 
@@ -102,8 +110,8 @@ python3 -m src.prediction.cli inspect --dataset data/historical_runs.csv
 
 - Python 3.11
 - LangGraph
-- Claude 3.5 Sonnet via AWS Bedrock
-- Tavily API
+- Optional AWS Bedrock or local Ollama model
+- Optional Tavily API research
 - PyGithub
 - Streamlit
 - pandas / numpy / scikit-learn / joblib
@@ -120,16 +128,16 @@ python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Open `http://127.0.0.1:8501`. For live GitHub collection/RCA, copy
-`.env.example` to `.env` and supply the relevant credentials. For model-backed
-risk scores, also collect at least 20 valid two-class runs and train or install
-a trusted model artifact.
+Open `http://127.0.0.1:8501`. Public GitHub metadata works anonymously; Actions
+logs require a fine-grained token entered for the session or supplied at
+deployment. For model-backed risk scores, collect at least 20 valid two-class
+runs and train or install a trusted model artifact.
 
 For a persistent single-container deployment:
 
 ```bash
-cp .env.example .env
-# Set APP_PASSWORD and ALLOWED_REPOSITORIES before public exposure.
+# An .env file is optional for credential-free local use. Before public
+# exposure, set APP_PASSWORD and ALLOWED_REPOSITORIES.
 docker compose up -d --build
 curl -fsS http://127.0.0.1:8501/_stcore/health
 ```
@@ -151,9 +159,35 @@ The Streamlit dashboard provides:
 - optional shared-password authentication, exact repository allowlisting, and
   a cooldown on external operations.
 
-The health endpoint proves only that Streamlit is alive. GitHub RCA additionally
-needs a scoped GitHub token; AI enrichment needs Tavily and AWS Bedrock access;
-prediction needs a trained model under `models/`.
+The health endpoint proves only that Streamlit is alive. Automatic GitHub log
+RCA additionally needs a scoped token. AI enrichment needs that token plus an
+explicit Bedrock or Ollama provider; Tavily is optional. Prediction needs a
+trained model under `models/`.
+
+### Optional AI enrichment providers
+
+No provider is enabled by default, so starting the application cannot incur an
+AWS charge. Choose exactly one provider only when enriched triage is wanted:
+
+```dotenv
+# AWS SDK credentials/profile/workload identity are resolved on use.
+LLM_PROVIDER=bedrock
+BEDROCK_MODEL_ID=anthropic.claude-3-5-sonnet-20240620-v1:0
+```
+
+or run Ollama separately and configure its local endpoint:
+
+```dotenv
+LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=llama3.1:8b
+```
+
+Inside Compose, use `http://host.docker.internal:11434` when Ollama runs on the
+host. `LLM_PROVIDER=auto` selects a detectable AWS identity first, then an
+explicitly configured Ollama endpoint; otherwise it stays in no-LLM mode.
+`TAVILY_API_KEY` adds web findings but is never required for the LLM or offline
+paths.
 
 ## Automated CI Training Data Generation
 
@@ -361,7 +395,9 @@ streamlit run app.py
 ## Environment Variables
 
 - `GITHUB_ACCESS_TOKEN`
-- `TAVILY_API_KEY`
+- `LLM_PROVIDER` (`none` by default; `auto`, `bedrock`, or `ollama`)
+- `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `OLLAMA_REQUEST_TIMEOUT_SECONDS`
+- `TAVILY_API_KEY` (optional web research)
 - `AWS_ACCESS_KEY_ID`
 - `AWS_SECRET_ACCESS_KEY`
 - `AWS_REGION`
@@ -427,10 +463,10 @@ duplicate push/PR predictor workflows and commit-SHA matching races.
 | Dataset validation, temporal split & leakage guards | **IMPLEMENTED** · **AUTOMATED TESTS PASS** |
 | GitHub history collection CLI | **VALIDATED** · collected 37 real public runs (16 success / 21 failure) |
 | Model training on real repo history | **VALIDATED, EXPERIMENTAL** · chronological 21/16 split; holdout accuracy 12.5%, F1 0.0 |
-| Pre-CI prediction in GitHub Actions | **IMPLEMENTED** · **NOT TESTED LIVE IN GITHUB ACTIONS** |
+| Pre-CI prediction in GitHub Actions | **IMPLEMENTED** · dependency/runtime path exercised in live PR CI; final green validation pending this branch run |
 | Feedback loop via `prediction-history` artifact | **IMPLEMENTED** · **NOT TESTED LIVE IN GITHUB ACTIONS** |
 | GHCR dashboard image publishing on `main` | **IMPLEMENTED** · **NOT TESTED LIVE IN GITHUB ACTIONS** |
-| LangGraph RCA (Bedrock + Tavily) | **IMPLEMENTED** · **TESTED WITH SYNTHETIC/MOCKED DATA** · **NOT TESTED LIVE** |
+| LangGraph AI enrichment (Bedrock or Ollama; Tavily optional) | **IMPLEMENTED** · **AUTOMATED PROVIDER/WORKFLOW TESTS PASS** · external model invocation not performed in this audit |
 | Culprit commit analyzer | **IMPLEMENTED** · **AUTOMATED TESTS PASS** |
 | Offline log RCA | **IMPLEMENTED** · **AUTOMATED TESTS PASS** |
 | Streamlit dashboard | **IMPLEMENTED** · **APPTEST + LOCAL HEALTH + BROWSER JOURNEY PASS** |
@@ -438,7 +474,8 @@ duplicate push/PR predictor workflows and commit-SHA matching races.
 | Controlled failure workflow | **IMPLEMENTED** · 17 completed runs observed in upstream history |
 
 Local verification currently passes `ruff`, `compileall`, `pip-audit`, and all
-104 tests. The locally generated real-history CSV and model artifacts are
+142 tests. The complete dependency set also resolves for the supported Python
+3.11 runtime. The locally generated real-history CSV and model artifacts are
 gitignored runtime state, not source-controlled release assets.
 Unit tests do **not** prove production readiness. Live validation requires valid
 runtime credentials, ≥20 varied two-class CI runs, a trusted trained model, and
@@ -448,7 +485,8 @@ an observed prediction/feedback/RCA cycle against real GitHub Actions.
 
 - Failure category prediction is optional and requires enough real labeled failures.
 - Predictions depend on historical run metadata that may be incomplete in some repositories.
-- The model does not replace the existing LLM-based RCA path.
+- The prediction model and optional LLM enrichment do not replace the
+  deterministic RCA path or human review.
 - The app does not fabricate confidence where the model does not support it.
 - Public workflow metadata can be collected anonymously with low rate limits;
   private repositories, dashboard-backed live GitHub operations, failed-run log

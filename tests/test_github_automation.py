@@ -76,9 +76,18 @@ class FakeRepo:
     updated_at = datetime(2026, 8, 30, tzinfo=UTC)
     permissions = SimpleNamespace(raw_data={"pull": True, "push": False})
 
-    def __init__(self, commits=None, runs=None):
+    def __init__(self, commits=None, runs=None, workflows=None):
         self.commits = commits or [_commit()]
         self.runs = runs or []
+        self.workflows = workflows or [
+            SimpleNamespace(
+                id=1,
+                name="CI/CD Pipeline",
+                path=".github/workflows/ci.yml",
+                state="active",
+                html_url="https://github.test/actions/workflows/ci.yml",
+            )
+        ]
 
     def get_commits(self, sha=None):
         assert sha == "main"
@@ -97,6 +106,9 @@ class FakeRepo:
 
     def get_workflow_run(self, run_id):
         return next(run for run in self.runs if run.id == run_id)
+
+    def get_workflows(self):
+        return self.workflows
 
 
 class FakeGithub:
@@ -150,7 +162,29 @@ def test_anonymous_connection_and_snapshot_use_real_repository_metadata():
     assert snapshot.connection.default_branch == "main"
     assert snapshot.commits[0].files[0].filename == "src/application.py"
     assert snapshot.commits[0].additions == 17
+    assert snapshot.workflows[0].name == "CI/CD Pipeline"
     assert snapshot.workflow_runs[0].head_sha == "abcdef1234567890"
+
+
+def test_workflow_discovery_reads_definitions_not_only_recent_run_names():
+    repo = FakeRepo(
+        runs=[_run(workflow_name="Legacy Run Name")],
+        workflows=[
+            SimpleNamespace(
+                id=91,
+                name="Current Pipeline",
+                path=".github/workflows/current.yml",
+                state="active",
+                html_url="https://github.test/actions/workflows/current.yml",
+            )
+        ],
+    )
+    service = GitHubAutomationService(token="", repository="owner/repo", github_client=FakeGithub(repo))
+
+    workflows = service.get_workflows()
+
+    assert [workflow.name for workflow in workflows] == ["Current Pipeline"]
+    assert workflows[0].path == ".github/workflows/current.yml"
 
 
 def test_authenticated_status_reports_account_but_never_serializes_token():

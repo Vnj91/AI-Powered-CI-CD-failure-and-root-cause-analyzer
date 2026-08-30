@@ -7,7 +7,7 @@ This agent analyzes parsed CI/CD errors and provides:
 - Initial fix suggestions
 - Determination of whether further research is needed
 
-Uses Claude via AWS Bedrock for intelligent analysis.
+Uses the configured optional LLM provider for enriched analysis.
 """
 
 import json
@@ -17,7 +17,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_aws import ChatBedrock
+from langchain_core.language_models.chat_models import BaseChatModel
 
 from ..tools.log_parser import ParsedError, ErrorCategory
 from ..utils.llm import get_llm
@@ -114,8 +114,7 @@ class TriageAgent:
         self.llm = self._create_llm()
         self.prompt = self._create_prompt()
     
-    def _create_llm(self) -> ChatBedrock:
-        print(f"Using shared Claude instance")
+    def _create_llm(self) -> BaseChatModel:
         return get_llm()
     
     def _create_prompt(self) -> ChatPromptTemplate:
@@ -200,12 +199,11 @@ class TriageAgent:
         print("Formatted!")
         chain = self.prompt | self.llm
         
-        print("\n Sending to claude for analysis..")
+        print("\n Sending to the configured LLM for analysis..")
         response = chain.invoke(prompts_vars)
-        print("\n Recieved res from claude")
+        print("\n Received response from the configured LLM")
         
         result = self._parse_llm_response(response.content)
         
         return result
-
 

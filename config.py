@@ -70,6 +70,15 @@ class Config:
         "BEDROCK_MODEL_ID",
         "anthropic.claude-3-5-sonnet-20240620-v1:0",
     )
+
+    # AI enrichment is opt-in. The deterministic parser/RCA path never needs
+    # an LLM, cloud account, or billable API. ``auto`` selects a detectable AWS
+    # identity first, then an explicitly configured Ollama endpoint.
+    LLM_PROVIDER = os.getenv("LLM_PROVIDER", "none").strip().lower()
+    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b").strip()
+    OLLAMA_EXPLICITLY_CONFIGURED = bool(os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_MODEL"))
+    OLLAMA_REQUEST_TIMEOUT_SECONDS = _configured_int("OLLAMA_REQUEST_TIMEOUT_SECONDS", 60, 1)
     
     # API Keys
     GITHUB_ACCESS_TOKEN = os.getenv("GITHUB_ACCESS_TOKEN")
@@ -110,14 +119,13 @@ class Config:
     
     @classmethod
     def validate(cls) -> Dict[str, Any]:
-        """Validate configuration and return status."""
+        """Validate required settings without failing optional capabilities."""
         issues = []
-        
-        if not cls.GITHUB_ACCESS_TOKEN:
-            issues.append("GITHUB_ACCESS_TOKEN not set")
-        
-        if not cls.TAVILY_API_KEY:
-            issues.append("TAVILY_API_KEY not set")
+        supported_providers = {"none", "auto", "bedrock", "ollama"}
+        if cls.LLM_PROVIDER not in supported_providers:
+            issues.append(
+                "LLM_PROVIDER must be one of: none, auto, bedrock, ollama"
+            )
         
         return {
             "valid": len(issues) == 0,
@@ -125,6 +133,9 @@ class Config:
             "config": {
                 "aws_region": cls.AWS_REGION,
                 "model_id": cls.BEDROCK_MODEL_ID,
+                "llm_provider": cls.LLM_PROVIDER,
+                "has_ollama_endpoint": bool(cls.OLLAMA_BASE_URL),
+                "ollama_model": cls.OLLAMA_MODEL,
                 "has_github_token": bool(cls.GITHUB_ACCESS_TOKEN),
                 "has_tavily_key": bool(cls.TAVILY_API_KEY),
                 "has_aws_credentials": cls.has_aws_credentials(),
@@ -143,6 +154,8 @@ class Config:
             or os.getenv("AWS_WEB_IDENTITY_TOKEN_FILE")
             or os.getenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
             or os.getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+            or (Path.home() / ".aws" / "credentials").exists()
+            or (Path.home() / ".aws" / "config").exists()
         )
 
     @classmethod

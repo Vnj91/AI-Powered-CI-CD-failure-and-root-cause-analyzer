@@ -20,12 +20,13 @@ from src.graph.state import (
     create_initial_state,
 )
 from src.tools.github_loader import fetch_failed_build_logs
-from src.tools.log_parser import parse_log_file
+from src.tools.log_parser import parse_log_content, parse_log_file
 from src.tools.commit_analyzer import analyze_culprit_for_repository
 from src.prediction.category_mapper import map_failure_category
 from src.agents.triage_agent import TriageAgent
 from src.agents.research_agent import ResearchAgent
 from src.agents.synthesis_agent import SynthesisAgent
+from src.utils.llm import LLMProviderUnavailable, get_llm_provider_status
 from config import Config
 
 load_dotenv()
@@ -157,7 +158,12 @@ def parse_node(state: GraphState) -> dict:
     print("\n[PARSE] Parsing logs...")
     
     try:
-        result = parse_log_file(state.log_file_path)
+        if state.log_file_path:
+            result = parse_log_file(state.log_file_path)
+        elif state.raw_log_content is not None:
+            result = parse_log_content(state.raw_log_content)
+        else:
+            raise ValueError("No workflow log content is available to parse.")
         
         if not result.primary_error:
             counts, _ = _updated_failure_counts(state, "parse", failed=True)
@@ -213,14 +219,18 @@ def triage_node(state: GraphState) -> dict:
         }
 
 
-def research_node(state: GraphState) -> dict:
+def research_node(state: GraphState, *, github_token: str | None = None) -> dict:
     """Research with delay and error handling."""
     print("\n[RESEARCH] Finding solutions...")
     print(f"[Rate Limit] Waiting {DELAY_BETWEEN_LLM_CALLS}s before LLM call...")
     time.sleep(DELAY_BETWEEN_LLM_CALLS)
     
     try:
-        agent = ResearchAgent(repo_name=state.repo_name)
+        agent = (
+            ResearchAgent(repo_name=state.repo_name, github_token=github_token)
+            if github_token
+            else ResearchAgent(repo_name=state.repo_name)
+        )
         result = agent.research(state.triage_result, state.primary_error)
         counts, _ = _updated_failure_counts(state, "research", failed=False)
         
@@ -241,7 +251,7 @@ def research_node(state: GraphState) -> dict:
         }
 
 
-def synthesize_node(state: GraphState) -> dict:
+def synthesize_node(state: GraphState, *, github_token: str | None = None) -> dict:
     """Synthesize with delay and error handling."""
     print("\n[SYNTHESIZE] Creating debugging brief...")
     print(f"[Rate Limit] Waiting {DELAY_BETWEEN_LLM_CALLS}s before LLM call...")
@@ -266,18 +276,24 @@ def synthesize_node(state: GraphState) -> dict:
         )
         brief.error_category = mapped_category.value
 
-        culprit = analyze_culprit_for_repository(
-            repo_name=state.repo_name,
-            parsed_error=state.primary_error,
-            error_category=mapped_category.value,
-            failed_step=state.primary_error.failed_step if state.primary_error else None,
-            workflow_run_id=state.workflow_run_id,
-        )
-        if culprit.commit_sha:
-            brief.likely_culprit_sha = culprit.commit_sha
-            brief.likely_culprit_message = culprit.commit_message
-            brief.likely_culprit_confidence = culprit.confidence
-            brief.likely_culprit_evidence = culprit.evidence
+        # Culprit ranking is an optional, deterministic enhancement. A GitHub
+        # metadata error must not discard an otherwise complete AI brief.
+        try:
+            culprit = analyze_culprit_for_repository(
+                repo_name=state.repo_name,
+                parsed_error=state.primary_error,
+                error_category=mapped_category.value,
+                failed_step=state.primary_error.failed_step if state.primary_error else None,
+                workflow_run_id=state.workflow_run_id,
+                github_token=github_token,
+            )
+            if culprit.commit_sha:
+                brief.likely_culprit_sha = culprit.commit_sha
+                brief.likely_culprit_message = culprit.commit_message
+                brief.likely_culprit_confidence = culprit.confidence
+                brief.likely_culprit_evidence = culprit.evidence
+        except Exception:
+            pass
 
         counts, _ = _updated_failure_counts(state, "synthesize", failed=False)
         
@@ -312,7 +328,7 @@ def route_from_supervisor(state: GraphState) -> Literal[
     return "__end__"
 
 
-def create_workflow() -> StateGraph:
+def create_workflow(*, github_token: str | None = None) -> StateGraph:
     """Create the workflow graph."""
     workflow = StateGraph(GraphState)
     
@@ -320,8 +336,8 @@ def create_workflow() -> StateGraph:
     workflow.add_node("ingest", ingest_node)
     workflow.add_node("parse", parse_node)
     workflow.add_node("triage", triage_node)
-    workflow.add_node("research", research_node)
-    workflow.add_node("synthesize", synthesize_node)
+    workflow.add_node("research", lambda state: research_node(state, github_token=github_token))
+    workflow.add_node("synthesize", lambda state: synthesize_node(state, github_token=github_token))
     
     workflow.add_edge(START, "supervisor")
     
@@ -370,6 +386,38 @@ def run_analysis(repo_name: str) -> GraphState:
     print("="*60)
     
     return final_state
+
+
+def run_enriched_analysis(
+    repo_name: str,
+    raw_log_content: str,
+    *,
+    workflow_run_id: int | None = None,
+    github_token: str | None = None,
+) -> GraphState:
+    """Run provider-backed enrichment on already-fetched, in-memory logs.
+
+    The dashboard uses this entry point after the bounded GitHub automation
+    service downloads and redacts a log archive. It avoids writing raw logs to
+    disk and does not place authentication tokens in graph state.
+    """
+
+    if not str(raw_log_content or "").strip():
+        raise ValueError("GitHub returned no readable workflow log content.")
+    provider = get_llm_provider_status()
+    if not provider.ready:
+        raise LLMProviderUnavailable(provider.detail)
+
+    initial_state = create_initial_state(repo_name).model_copy(
+        update={
+            "raw_log_content": raw_log_content,
+            "workflow_run_id": workflow_run_id,
+            "current_phase": WorkflowPhase.PARSING,
+            "messages": [f"Workflow initialized from GitHub run {workflow_run_id or 'unknown'}"],
+        }
+    )
+    final_state = create_workflow(github_token=github_token).invoke(initial_state)
+    return GraphState(**final_state) if isinstance(final_state, dict) else final_state
 
 
 if __name__ == "__main__":

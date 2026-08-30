@@ -64,24 +64,37 @@ def test_downloaded_logs_use_run_specific_filenames(monkeypatch, tmp_path):
 def test_culprit_analysis_uses_the_ingested_run_id(monkeypatch):
     failed_run = SimpleNamespace(id=42, head_sha="abc123def456")
     commit = SimpleNamespace(
-        files=[SimpleNamespace(filename="requirements.txt")],
-        commit=SimpleNamespace(message="Update dependencies"),
-        author=SimpleNamespace(login="developer"),
+        sha=failed_run.head_sha,
+        changed_files=["requirements.txt"],
+        message="Update dependencies",
+        author_login="developer",
+        author_name=None,
     )
 
-    class FakeRepo:
-        def get_workflow_run(self, run_id):
+    class FakeAutomation:
+        def __init__(self, token=None, repository=None):
+            assert token == "session-token"
+            assert repository == "owner/repo"
+
+        def get_workflow_run(self, run_id, repository=None):
             assert run_id == 42
+            assert repository == "owner/repo"
             return failed_run
 
-        def get_commit(self, sha):
+        def get_commit_changes(self, sha, repository=None):
             assert sha == failed_run.head_sha
+            assert repository == "owner/repo"
             return commit
 
-    fake_client = SimpleNamespace(get_repo=lambda repository: FakeRepo())
-    monkeypatch.setattr(github_loader, "get_github_client", lambda: fake_client)
+    import src.integrations.github_automation as github_automation
 
-    result = analyze_culprit_for_repository("owner/repo", workflow_run_id=42)
+    monkeypatch.setattr(github_automation, "GitHubAutomationService", FakeAutomation)
+
+    result = analyze_culprit_for_repository(
+        "owner/repo",
+        workflow_run_id=42,
+        github_token="session-token",
+    )
 
     assert result.commit_sha == failed_run.head_sha
     assert "Dependency manifest changed" in result.evidence

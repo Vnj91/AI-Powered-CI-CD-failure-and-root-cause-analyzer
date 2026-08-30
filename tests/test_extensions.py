@@ -225,6 +225,40 @@ def test_history_store_pending_commit_lookup(tmp_path):
     assert ok and pid and status == "recorded"
 
 
+def test_history_store_refuses_ambiguous_abbreviated_sha(tmp_path):
+    store = PredictionHistoryStore(tmp_path / "history.csv")
+    prediction = FailurePrediction(
+        model_available=True,
+        failure_probability=0.4,
+        predicted_failure=False,
+        risk_level="LOW",
+        model_version="test",
+    )
+    store.append_prediction("owner/repo", "ci", None, "deadbee" + "1" * 33, prediction)
+    store.append_prediction("owner/repo", "ci", None, "deadbee" + "2" * 33, prediction)
+
+    assert store.find_pending_by_commit("owner/repo", "deadbee", "ci") is None
+
+
+def test_history_store_prefers_exact_sha_over_prefix_collision(tmp_path):
+    store = PredictionHistoryStore(tmp_path / "history.csv")
+    prediction = FailurePrediction(
+        model_available=True,
+        failure_probability=0.4,
+        predicted_failure=False,
+        risk_level="LOW",
+        model_version="test",
+    )
+    exact_sha = "deadbee" + "1" * 33
+    expected = store.append_prediction("owner/repo", "ci", None, exact_sha, prediction)
+    store.append_prediction("owner/repo", "ci", None, "deadbee" + "2" * 33, prediction)
+
+    pending = store.find_pending_by_commit("owner/repo", exact_sha, "ci")
+
+    assert pending is not None
+    assert pending["prediction_id"] == expected
+
+
 def test_temporal_ordering_uses_run_id_tiebreaker():
     frame = pd.DataFrame(
         {

@@ -9,7 +9,6 @@ from ..utils.redaction import redact_sensitive_text
 
 
 load_dotenv()
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 
 
@@ -49,16 +48,15 @@ class TavilySearchTool:
             print(result.title, result.content[:100])
     """
     
-    def __init__(self):
+    def __init__(self, api_key: Optional[str] = None):
         """Initialize the Tavily client."""
-        if not TAVILY_API_KEY:
+        configured_key = str(api_key or os.getenv("TAVILY_API_KEY") or "").strip()
+        if not configured_key:
             raise ValueError(
-                "TAVILY_API_KEY not found!\n"
-                "Please add your Tavily API key to the .env file.\n"
+                "Tavily web research is not configured. Set TAVILY_API_KEY or continue without web research."
             )
-        
-        self.client = TavilyClient(api_key=TAVILY_API_KEY)
-        print("Tavily Search initialized")
+
+        self.client = TavilyClient(api_key=configured_key)
     
     def search(
         self,
@@ -80,14 +78,13 @@ class TavilySearchTool:
             SearchResponse with results and optional answer
         """
         query = redact_sensitive_text(query, limit=500)
-        print(f"🔍 Searching: \"{query}\"")
-        
         try:
             response = self.client.search(
                 query=query,
                 max_results=max_results,
                 search_depth=search_depth,
-                include_answer=include_answer
+                include_answer=include_answer,
+                timeout=30,
             )
             
             results = []
@@ -105,12 +102,9 @@ class TavilySearchTool:
                 answer=response.get("answer")
             )
             
-            print(f"Found {len(results)} results")
-            
             return search_response
-            
-        except Exception as e:
-            print(f"❌ Search failed: {e}")
+
+        except Exception:
             return SearchResponse(query=query, results=[], answer=None)
     
     def search_multiple(

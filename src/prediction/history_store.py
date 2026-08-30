@@ -116,13 +116,35 @@ class PredictionHistoryStore:
         if frame.empty:
             return None
 
-        mask = (
-            frame["repository"].astype(str) == repository
-        ) & (
-            frame["commit_sha"].astype(str).str.startswith(str(commit_sha)[:7])
-        )
+        target_sha = str(commit_sha or "").strip().lower()
+        if len(target_sha) < 7:
+            return None
+
+        repository_mask = frame["repository"].astype(str).str.casefold() == repository.casefold()
+        stored_shas = frame["commit_sha"].fillna("").astype(str).str.strip().str.lower()
+        # Prefer an exact full SHA. Prefix matching is retained only for legacy
+        # history rows that genuinely stored an abbreviated SHA.
+        sha_mask = stored_shas == target_sha
+        exact_match_found = bool(sha_mask.any())
+        if not exact_match_found:
+            sha_mask = stored_shas.map(
+                lambda stored: (
+                    len(stored) >= 7
+                    and (len(stored) < 40 or len(target_sha) < 40)
+                    and (stored.startswith(target_sha) or target_sha.startswith(stored))
+                )
+            )
+
+        mask = repository_mask & sha_mask
         if workflow:
             mask &= frame["workflow"].astype(str) == workflow
+
+        if not exact_match_found:
+            complete_candidates = {
+                value for value in stored_shas[mask].tolist() if len(value) >= 40
+            }
+            if len(complete_candidates) > 1:
+                return None
 
         pending = frame[mask & frame["actual_failure"].isna()]
         if pending.empty:

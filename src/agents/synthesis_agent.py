@@ -22,7 +22,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
-from langchain_aws import ChatBedrock
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 
 from ..tools.log_parser import ParsedError
@@ -69,8 +69,7 @@ class SynthesisAgent:
         ])
         print("✅ Synthesis Agent initialized!")
     
-    def _create_llm(self) -> ChatBedrock:
-        print(f"Using shared Claude instance")
+    def _create_llm(self) -> BaseChatModel:
         return get_llm()
     
     def _format_prompt_variables(

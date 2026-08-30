@@ -12,20 +12,35 @@ deployment behind TLS and enable both access controls below.
 ## Runtime requirements
 
 - Python 3.11 or newer
-- Network access to GitHub, AWS Bedrock, and Tavily for live, AI-enriched analysis
+- Network access to GitHub for automatic repository/log operations
+- Optional access to AWS Bedrock or a separately running Ollama server for AI enrichment
+- Optional Tavily network access for web-research enrichment
 - A writable filesystem for `data/`, `models/`, and `output/`
 - A trained predictor artifact for model-backed failure-risk scores
 
 Create a `.env` file locally and keep it out of source control:
 
 ```dotenv
+# Optional: automatic Actions log retrieval. A session token can instead be
+# entered in the dashboard and is never persisted by the application.
 GITHUB_ACCESS_TOKEN=replace_with_a_fine_grained_token
-TAVILY_API_KEY=replace_with_a_tavily_key
-AWS_ACCESS_KEY_ID=replace_with_an_access_key
-AWS_SECRET_ACCESS_KEY=replace_with_a_secret_key
-AWS_REGION=us-east-1
+
+# AI enrichment is opt-in and disabled by default.
+LLM_PROVIDER=none
+
+# Bedrock option (prefer a profile/workload identity over static keys).
+# LLM_PROVIDER=bedrock
+# AWS_REGION=us-east-1
 # BEDROCK_MODEL_ID=replace_with_an_enabled_bedrock_model_id
-# AWS_SESSION_TOKEN=replace_when_using_temporary_credentials
+# AWS_PROFILE=replace_with_a_profile
+
+# Local Ollama option.
+# LLM_PROVIDER=ollama
+# OLLAMA_BASE_URL=http://127.0.0.1:11434
+# OLLAMA_MODEL=llama3.1:8b
+
+# Optional for web research; not required for either provider.
+# TAVILY_API_KEY=replace_with_a_tavily_key
 
 # Set both controls before exposing the dashboard publicly.
 APP_PASSWORD=replace_with_a_long_random_password
@@ -45,15 +60,34 @@ The server and credential-free log triage can run without external API
 credentials. Users can paste or upload a `.log` or `.txt` file and receive a
 deterministic local debugging brief; that log content is not sent to GitHub,
 Bedrock, or Tavily. GitHub collection and live failed-run analysis still require
-their documented credentials, and model-backed risk scores require a trained
-model artifact. A healthy process therefore does not by itself prove that every
-external integration is configured.
+a repository name and, for Actions logs, a scoped token. AI enrichment requires
+an explicit Bedrock or Ollama provider; Tavily remains optional. Model-backed
+risk scores require a trained model artifact. A healthy process therefore does
+not by itself prove that every external integration is configured.
 
 `APP_PASSWORD` enables the dashboard's shared-password gate.
 `ALLOWED_REPOSITORIES` is a comma-separated, case-insensitive repository
 allowlist used by GitHub-backed operations. An empty password disables the
 gate, and an empty allowlist permits any syntactically valid repository. Set
 both variables for every publicly reachable deployment.
+
+### AI provider behavior
+
+`LLM_PROVIDER=none` is the default and guarantees the application does not
+construct a Bedrock or Ollama client. `bedrock` uses the normal AWS SDK
+credential chain and performs model calls only when a user starts AI-enriched
+analysis. `ollama` uses the configured local HTTP endpoint; the Ollama server
+and selected model must be installed separately. `auto` chooses a detectable
+AWS identity first, then an explicitly configured Ollama endpoint, and otherwise
+stays disabled. Tavily is an independent optional enhancement.
+
+For Compose with Ollama running on the host, set:
+
+```dotenv
+LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://host.docker.internal:11434
+OLLAMA_MODEL=llama3.1:8b
+```
 
 ## Local virtual environment
 
@@ -80,10 +114,12 @@ Build and start a disposable container:
 ```bash
 docker build -t cicd-root-cause-analyzer:local .
 docker run --rm --name cicd-root-cause-analyzer \
-  --env-file .env \
   -p 8501:8501 \
   cicd-root-cause-analyzer:local
 ```
+
+Add `--env-file .env` only when integrations or deployment access controls are
+configured. Credential-free startup does not need an environment file.
 
 This direct command does not preserve runtime state after the container is
 removed. Use Compose for normal operation.
@@ -92,7 +128,8 @@ removed. Use Compose for normal operation.
 
 `compose.yaml` runs exactly one container, drops Linux capabilities, uses a
 read-only root filesystem, and keeps the three writable application paths in
-named volumes.
+named volumes. It starts successfully without `.env`; Compose automatically
+uses that file when present and passes the supported variables explicitly.
 
 Validate the Compose definition, build the image, and start it:
 
@@ -144,9 +181,9 @@ Compose definition, Streamlit server config, `.dockerignore`, environment
 template, and this deployment guide. The release job validates that manifest
 and rejects generated Python bytecode before uploading the archive.
 
-After downloading and extracting the artifact, create `.env` from
-`.env.example`, configure the access controls and integrations described above,
-then run the same `docker compose up -d --build` command. The artifact is a
+After downloading and extracting the artifact, optionally create `.env` from
+`.env.example`, configure the access controls required for the intended
+exposure, then run the same `docker compose up -d --build` command. The artifact is a
 self-hosting bundle; it is not evidence of a rollout to a managed cloud target.
 
 ## CI-published container image
@@ -177,7 +214,8 @@ Any container platform can run the image if it provides all of the following:
    `PORT` outside Compose), including WebSocket support.
 2. Persistent writable mounts at `/home/appuser/app/data`,
    `/home/appuser/app/models`, and `/home/appuser/app/output`.
-3. Runtime secret injection or an AWS workload identity. Never bake `.env` into
+3. Runtime secret injection only for capabilities that are enabled. A Bedrock
+   deployment may instead use an AWS workload identity. Never bake `.env` into
    the image.
 4. `APP_PASSWORD` and `ALLOWED_REPOSITORIES` configured as runtime secrets or
    environment values, plus an HTTPS reverse proxy or ingress.
@@ -208,6 +246,8 @@ with a token that can read unrestricted private repositories.
 - Authentication blocks anonymous access and the GitHub token cannot access a
   repository outside the approved set.
 
-The Streamlit health endpoint is a liveness check only. Complete readiness also
-requires valid credentials, Bedrock model access, a usable model artifact, and
-successful connectivity to external APIs.
+The Streamlit health endpoint is a liveness check only. Deterministic RCA is
+ready whenever the process is healthy. Each optional capability has its own
+readiness contract: GitHub Actions logs need a scoped token, prediction needs a
+usable model artifact, Bedrock needs AWS model access, Ollama needs its local
+server/model, and Tavily research needs its API key and network connectivity.

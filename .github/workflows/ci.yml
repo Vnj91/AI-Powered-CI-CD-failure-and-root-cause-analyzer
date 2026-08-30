@@ -17,6 +17,9 @@ permissions:
 env:
   PYTHON_VERSION: "3.11"
   IMAGE_NAME: cicd-root-cause-analyzer:test
+  # CI validates the credential-free product. Optional providers are exercised
+  # with mocks and must never trigger cloud or local-model calls in CI.
+  LLM_PROVIDER: "none"
 
 jobs:
   predict-failure-risk:
@@ -247,8 +250,8 @@ jobs:
 
       - name: Validate prediction pipeline software
         run: |
-          pytest -q tests/test_prediction.py tests/test_extensions.py tests/test_gha_actions.py \
-            -k "feature_extraction or history_store or trainer_predictor or category_model or collector_builds or dataset_validator or feedback or corrupt or probability or gha_"
+          pytest -q tests/test_prediction.py tests/test_extensions.py tests/test_gha_actions.py tests/test_llm_provider.py \
+            -k "feature_extraction or history_store or trainer_predictor or category_model or collector_builds or dataset_validator or feedback or corrupt or probability or gha_ or provider or ollama or bedrock"
 
   build:
     name: Build / App Validation
@@ -280,6 +283,7 @@ jobs:
         env:
           GITHUB_ACCESS_TOKEN: ""
           TAVILY_API_KEY: ""
+          LLM_PROVIDER: "none"
           AWS_ACCESS_KEY_ID: ""
           AWS_SECRET_ACCESS_KEY: ""
         run: |

@@ -39,6 +39,10 @@ def _bootstrap_streamlit_secrets() -> None:
         "AWS_SESSION_TOKEN",
         "AWS_REGION",
         "BEDROCK_MODEL_ID",
+        "LLM_PROVIDER",
+        "OLLAMA_BASE_URL",
+        "OLLAMA_MODEL",
+        "OLLAMA_REQUEST_TIMEOUT_SECONDS",
         "APP_PASSWORD",
         "ALLOWED_REPOSITORIES",
         "DEFAULT_REPOSITORY",
@@ -63,7 +67,7 @@ _bootstrap_streamlit_secrets()
 from config import Config  # noqa: E402
 from src.analysis import build_local_debugging_brief  # noqa: E402
 from src.graph.state import DebuggingBrief  # noqa: E402
-from src.graph.workflow import run_analysis  # noqa: E402
+from src.graph.workflow import run_enriched_analysis  # noqa: E402
 from src.prediction import (  # noqa: E402
     FailurePredictionService,
     FailurePredictorTrainer,
@@ -74,6 +78,7 @@ from src.prediction.feedback import PredictionFeedbackService  # noqa: E402
 from src.prediction.history_store import PredictionHistoryStore  # noqa: E402
 from src.tools.log_parser import LogParseResult, parse_log_content  # noqa: E402
 from src.utils.redaction import redact_sensitive_text  # noqa: E402
+from src.utils.llm import get_llm_provider_status  # noqa: E402
 
 
 _REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -246,13 +251,22 @@ def _github_runtime_token() -> str | None:
 
 def _runtime_rows(service: FailurePredictionService) -> list[dict[str, str]]:
     report = validate_dataset(Config.HISTORICAL_DATASET_PATH)
-    ai_ready = bool(Config.GITHUB_ACCESS_TOKEN and Config.TAVILY_API_KEY and Config.has_aws_credentials())
     github_token = _github_runtime_token()
+    provider = get_llm_provider_status()
     return [
         {"Capability": "Offline log triage", "Status": "Ready", "Requirement": "None"},
         {"Capability": "Public GitHub metadata", "Status": "Ready", "Requirement": "Repository name"},
         {"Capability": "GitHub Actions logs", "Status": "Ready" if github_token else "Setup needed", "Requirement": "Session or deployment token"},
-        {"Capability": "AI RCA enrichment", "Status": "Ready" if ai_ready else "Setup needed", "Requirement": "GitHub + Tavily + Bedrock"},
+        {
+            "Capability": "AI RCA enrichment",
+            "Status": "Ready" if provider.ready and github_token else "Setup needed",
+            "Requirement": f"GitHub token + {provider.display_name}",
+        },
+        {
+            "Capability": "Optional web research",
+            "Status": "Ready" if Config.TAVILY_API_KEY else "Optional",
+            "Requirement": "Tavily key",
+        },
         {"Capability": "Failure-risk prediction", "Status": _model_status(service), "Requirement": "Trained, validated model"},
         {"Capability": "Model retraining", "Status": "Ready" if report.sufficient_for_training else "Data needed", "Requirement": "20+ real, two-class runs"},
     ]
@@ -295,12 +309,16 @@ def _persist_github_snapshot(
     status: Any,
     commits: Any,
     runs: Any,
+    workflows: Any = None,
+    workflow_error: str | None = None,
 ) -> None:
     st.session_state["github_snapshot"] = {
         "repository": repository,
         "status": _as_dict(status),
         "commits": _as_rows(commits),
         "runs": _as_rows(runs),
+        "workflows": _as_rows(workflows),
+        "workflow_error": workflow_error,
         "refreshed_at": datetime.now(UTC).isoformat(),
     }
 
@@ -352,6 +370,7 @@ def _render_failure_trend(dataset: pd.DataFrame) -> bool:
     # timestamp portable while the explicit temporal encoding preserves scale.
     chart_data["timestamp"] = chart_data["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     chart = {
+        "data": {"values": chart_data.to_dict(orient="records")},
         "mark": {"type": "line", "point": {"filled": True, "size": 36}},
         "encoding": {
             "x": {
@@ -383,7 +402,7 @@ def _render_failure_trend(dataset: pd.DataFrame) -> bool:
             ],
         },
     }
-    st.vega_lite_chart(chart_data, chart, width="stretch", height=285)
+    st.vega_lite_chart(chart, width="stretch", height=285)
     st.caption("Ten-run rolling failure rate, ordered by workflow start time.")
     return True
 
@@ -403,6 +422,7 @@ def _render_failure_categories(dataset: pd.DataFrame) -> bool:
         return False
     chart_data = counts.reset_index()
     chart = {
+        "data": {"values": chart_data.to_dict(orient="records")},
         "mark": {"type": "bar", "cornerRadiusTopLeft": 4, "cornerRadiusTopRight": 4},
         "encoding": {
             "x": {
@@ -425,7 +445,7 @@ def _render_failure_categories(dataset: pd.DataFrame) -> bool:
             ],
         },
     }
-    st.vega_lite_chart(chart_data, chart, width="stretch", height=285)
+    st.vega_lite_chart(chart, width="stretch", height=285)
     st.caption("Observed failure categories in the active workflow history.")
     return True
 
@@ -458,6 +478,7 @@ def _render_change_risk(dataset: pd.DataFrame) -> bool:
         return False
     grouped["Change size"] = grouped["Change size"].astype(str)
     chart = {
+        "data": {"values": grouped.to_dict(orient="records")},
         "mark": {"type": "bar", "cornerRadiusTopLeft": 4, "cornerRadiusTopRight": 4},
         "encoding": {
             "x": {
@@ -486,7 +507,7 @@ def _render_change_risk(dataset: pd.DataFrame) -> bool:
             ],
         },
     }
-    st.vega_lite_chart(grouped, chart, width="stretch", height=285)
+    st.vega_lite_chart(chart, width="stretch", height=285)
     st.caption("Observed failure rate by added-plus-deleted line count; association is not causality.")
     return True
 
@@ -506,6 +527,7 @@ def _render_prediction_trend(history: pd.DataFrame) -> bool:
     chart_data = trend[["timestamp", "failure_probability"]].copy()
     chart_data["timestamp"] = chart_data["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     chart = {
+        "data": {"values": chart_data.to_dict(orient="records")},
         "mark": {"type": "line", "point": {"filled": True, "size": 36}},
         "encoding": {
             "x": {
@@ -537,7 +559,7 @@ def _render_prediction_trend(history: pd.DataFrame) -> bool:
             ],
         },
     }
-    st.vega_lite_chart(chart_data, chart, width="stretch", height=285)
+    st.vega_lite_chart(chart, width="stretch", height=285)
     st.caption("Recorded pre-CI predictions only; retrospective scores are excluded from feedback history.")
     return True
 
@@ -806,16 +828,23 @@ def render_local_analysis(repository: str) -> None:
 
 def render_live_analysis(repository: str) -> None:
     st.markdown("#### AI-enriched GitHub failed-run analysis")
-    st.caption("Fetches the most recent failed Actions run and uses Bedrock plus Tavily to create an enriched brief.")
+    provider = get_llm_provider_status()
+    st.caption(
+        f"Fetches bounded, redacted Actions logs and uses {provider.display_name}. "
+        "Tavily web research is optional."
+    )
     missing = []
-    if not Config.GITHUB_ACCESS_TOKEN:
-        missing.append("GITHUB_ACCESS_TOKEN")
-    if not Config.TAVILY_API_KEY:
-        missing.append("TAVILY_API_KEY")
-    if not Config.has_aws_credentials():
-        missing.append("AWS identity")
+    runtime_token = _github_runtime_token()
+    if not runtime_token:
+        missing.append("a session or deployment GitHub token with Actions: read")
+    if not provider.ready:
+        missing.append(provider.detail)
     if missing:
-        st.warning("Live AI analysis needs: " + ", ".join(missing) + ". Offline triage remains available.")
+        st.warning("AI enrichment needs " + "; ".join(missing) + " Offline triage remains available.")
+    if Config.TAVILY_API_KEY:
+        st.info("Tavily research is enabled for this analysis.")
+    else:
+        st.info("Tavily is not configured; analysis will continue with logs, code context, and the selected LLM.")
     repository_problem = _repository_error(repository)
     if repository_problem:
         st.info(repository_problem)
@@ -828,7 +857,28 @@ def render_live_analysis(repository: str) -> None:
         if _cooldown_allows("live_rca"):
             with st.spinner("Fetching the latest failed run and building the debugging brief…"):
                 try:
-                    st.session_state["live_analysis"] = run_analysis(repository)
+                    from src.integrations.github_automation import GitHubAutomationService
+
+                    workflow_choice = st.session_state.get("automation_workflow", "CI/CD Pipeline")
+                    workflow_name = None if workflow_choice == "All workflows" else workflow_choice
+                    automation = GitHubAutomationService(token=runtime_token, repository=repository)
+                    context = automation.latest_failed_run_context(
+                        repository=repository,
+                        workflow_name=workflow_name,
+                        include_system_workflows=workflow_name is None,
+                        include_logs=True,
+                    )
+                    log_text = _extract_log_text(context)
+                    if not log_text:
+                        context_error = _as_dict(context).get("logs_error")
+                        raise ValueError(context_error or "GitHub returned no readable log content.")
+                    run_payload = _as_dict(_as_dict(context).get("run"))
+                    st.session_state["live_analysis"] = run_enriched_analysis(
+                        repository,
+                        log_text,
+                        workflow_run_id=run_payload.get("id"),
+                        github_token=runtime_token,
+                    )
                 except Exception as exc:
                     st.error(f"Live analysis failed: {_safe_message(exc)}")
     state = st.session_state.get("live_analysis")
@@ -849,7 +899,22 @@ def _refresh_repository_snapshot(automation: Any, repository: str) -> Any:
         raise ValueError(status_payload.get("error") or "GitHub could not connect to this repository.")
     commits = automation.get_recent_commits(repository=repository, limit=10)
     runs = automation.get_workflow_runs(repository=repository, limit=20)
-    _persist_github_snapshot(repository, status=status, commits=commits, runs=runs)
+    get_workflows = getattr(automation, "get_workflows", None)
+    workflows = []
+    workflow_error = None
+    if callable(get_workflows):
+        try:
+            workflows = get_workflows(repository=repository, limit=100)
+        except Exception as exc:
+            workflow_error = _safe_message(exc)
+    _persist_github_snapshot(
+        repository,
+        status=status,
+        commits=commits,
+        runs=runs,
+        workflows=workflows,
+        workflow_error=workflow_error,
+    )
     return status
 
 
@@ -1044,13 +1109,24 @@ def render_automation(repository: str, prediction_service: FailurePredictionServ
     connected = bool(status.get("connected"))
     authenticated = bool(status.get("authenticated"))
 
-    workflow_names = sorted(
-        {
-            str(run.get("workflow_name"))
-            for run in snapshot.get("runs", [])
-            if run.get("workflow_name")
-        }
-    )
+    discovered_workflow_names = {
+        str(workflow.get("name"))
+        for workflow in snapshot.get("workflows", [])
+        if workflow.get("name") and str(workflow.get("state") or "active").lower() == "active"
+    }
+    # Run names are a compatibility fallback for repositories or tokens that
+    # cannot enumerate workflow definitions.
+    run_workflow_names = {
+        str(run.get("workflow_name"))
+        for run in snapshot.get("runs", [])
+        if run.get("workflow_name")
+    }
+    workflow_names = sorted(discovered_workflow_names or run_workflow_names)
+    if snapshot.get("workflow_error"):
+        st.caption(
+            "Workflow definitions could not be enumerated; the selector is using recent run names. "
+            + str(snapshot["workflow_error"])
+        )
     default_workflow = "CI/CD Pipeline"
     workflow_options = ["All workflows"] + workflow_names
     if default_workflow not in workflow_options:
@@ -1091,6 +1167,8 @@ def render_automation(repository: str, prediction_service: FailurePredictionServ
                         st.error(f"Latest-change prediction failed: {_safe_message(exc)}")
             if not prediction_service.model_available:
                 st.caption("Train or download the failure model to enable scoring.")
+            elif not connected:
+                st.caption("Connect this repository before scoring its latest commit.")
     with actions[1]:
         with st.container(border=True):
             st.markdown("**Analyze latest failure**")
@@ -1132,6 +1210,8 @@ def render_automation(repository: str, prediction_service: FailurePredictionServ
                         st.error(f"Automatic failed-run analysis failed: {_safe_message(exc)}")
             if logs_need_auth:
                 st.caption("Add a repository-scoped token with Actions: read permission to fetch logs.")
+            elif not connected:
+                st.caption("Connect this repository before fetching failed-run logs.")
     with actions[2]:
         with st.container(border=True):
             st.markdown("**Sync CI history**")
@@ -1154,6 +1234,8 @@ def render_automation(repository: str, prediction_service: FailurePredictionServ
                         st.rerun()
                     except Exception as exc:
                         st.error(f"History sync failed: {_safe_message(exc)}")
+            if not connected:
+                st.caption("Connect this repository before synchronizing workflow history.")
 
     _render_repository_activity(snapshot)
     if result := st.session_state.get("automated_prediction"):
@@ -1407,16 +1489,27 @@ with st.sidebar:
     ).strip()
     st.divider()
     st.markdown("**Runtime**")
-    st.write("● Offline triage ready")
+    st.write("● Offline deterministic RCA · ready")
     sidebar_snapshot = _github_snapshot(repository_name)
     sidebar_status = sidebar_snapshot.get("status", {})
     if sidebar_status.get("connected"):
         identity = sidebar_status.get("account_login") or "public metadata"
         st.write(f"● GitHub connected · {identity}")
     else:
-        st.write("○ Connect repository in Automation")
-    st.write("● Bedrock identity found" if Config.has_aws_credentials() else "○ AWS identity missing")
-    st.write("● Tavily connected" if Config.TAVILY_API_KEY else "○ Tavily key missing")
+        st.write("○ GitHub repository · setup needed")
+    if st.button(
+        "Open Automation setup" if not sidebar_status.get("connected") else "Open Automation",
+        key="open_automation_setup",
+        width="stretch",
+    ):
+        st.session_state["dashboard_tab"] = "Automation"
+        st.rerun()
+    sidebar_provider = get_llm_provider_status()
+    if sidebar_provider.ready:
+        st.write(f"● AI provider · {sidebar_provider.display_name}")
+    else:
+        st.write("○ AI enrichment · disabled")
+    st.write("● Tavily research · optional/ready" if Config.TAVILY_API_KEY else "○ Tavily research · optional")
     st.divider()
     st.caption(f"Version {Config.VERSION} · single-replica local persistence")
 
@@ -1432,7 +1525,10 @@ if notice := st.session_state.pop("artifact_notice", None):
 
 prediction_service = _prediction_service()
 automation_tab, overview_tab, analytics_tab, analyze_tab, predict_tab, model_tab, feedback_tab = st.tabs(
-    ("Automation", "Overview", "Analytics", "Failure analysis", "Risk lab", "Data & model", "Feedback")
+    ("Automation", "Overview", "Analytics", "Failure analysis", "Risk lab", "Data & model", "Feedback"),
+    default="Automation",
+    key="dashboard_tab",
+    on_change="rerun",
 )
 with automation_tab:
     render_automation(repository_name, prediction_service)

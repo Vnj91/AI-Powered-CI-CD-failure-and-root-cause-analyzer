@@ -132,6 +132,16 @@ class GitHubWorkflowRunSummary(BaseModel):
     html_url: Optional[str] = None
 
 
+class GitHubWorkflowSummary(BaseModel):
+    """An actual Actions workflow configured in the selected repository."""
+
+    id: int
+    name: str
+    path: Optional[str] = None
+    state: Optional[str] = None
+    html_url: Optional[str] = None
+
+
 class GitHubWorkflowStepSummary(BaseModel):
     """A job step shown without requiring a raw log upload."""
 
@@ -216,6 +226,7 @@ class GitHubAutomationSnapshot(BaseModel):
 
     connection: GitHubConnectionStatus
     commits: list[GitHubCommitSnapshot] = Field(default_factory=list)
+    workflows: list[GitHubWorkflowSummary] = Field(default_factory=list)
     workflow_runs: list[GitHubWorkflowRunSummary] = Field(default_factory=list)
 
 
@@ -534,6 +545,31 @@ class GitHubAutomationService:
         except GithubException as exc:
             raise GitHubAutomationError(f"Could not load GitHub Actions runs: {_safe_error(exc)}") from exc
 
+    def get_workflows(
+        self,
+        repository: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[GitHubWorkflowSummary]:
+        """Discover repository workflows instead of inferring them from run history."""
+
+        repo = self._repo(repository)
+        try:
+            workflows = repo.get_workflows()
+            summaries = []
+            for workflow in _limited(workflows, min(max(limit, 0), 100)):
+                summaries.append(
+                    GitHubWorkflowSummary(
+                        id=_safe_int(getattr(workflow, "id", None)),
+                        name=str(getattr(workflow, "name", None) or "unknown"),
+                        path=getattr(workflow, "path", None),
+                        state=getattr(workflow, "state", None),
+                        html_url=getattr(workflow, "html_url", None),
+                    )
+                )
+            return summaries
+        except GithubException as exc:
+            raise GitHubAutomationError(f"Could not discover GitHub Actions workflows: {_safe_error(exc)}") from exc
+
     def get_latest_failed_run(
         self,
         repository: Optional[str] = None,
@@ -589,6 +625,19 @@ class GitHubAutomationService:
             return [self._job_summary(job) for job in run.jobs()]
         except GithubException as exc:
             raise GitHubAutomationError(f"Could not load jobs for run {int(run_id)}: {_safe_error(exc)}") from exc
+
+    def get_workflow_run(
+        self,
+        run_id: int,
+        repository: Optional[str] = None,
+    ) -> GitHubWorkflowRunSummary:
+        """Fetch one exact workflow run by its stable GitHub run ID."""
+
+        repo = self._repo(repository)
+        try:
+            return self._run_summary(repo.get_workflow_run(int(run_id)))
+        except GithubException as exc:
+            raise GitHubAutomationError(f"Could not load workflow run {int(run_id)}: {_safe_error(exc)}") from exc
 
     def _download_bytes(self, url: str, max_bytes: int) -> bytes:
         headers = {
@@ -894,6 +943,7 @@ class GitHubAutomationService:
         return GitHubAutomationSnapshot(
             connection=connection,
             commits=self.get_recent_commits(name, branch=branch, limit=commit_limit),
+            workflows=self.get_workflows(name),
             workflow_runs=self.get_workflow_runs(
                 name,
                 limit=run_limit,
@@ -919,5 +969,6 @@ __all__ = [
     "GitHubWorkflowLogBundle",
     "GitHubWorkflowLogFile",
     "GitHubWorkflowRunSummary",
+    "GitHubWorkflowSummary",
     "GitHubWorkflowStepSummary",
 ]
