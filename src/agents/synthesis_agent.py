@@ -22,7 +22,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
-from langchain_aws import ChatBedrock
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 
 from ..tools.log_parser import ParsedError
@@ -30,6 +30,7 @@ from .triage_agent import TriageResult
 from .research_agent import ResearchResult
 from ..graph.state import DebuggingBrief, FixSuggestion
 from ..utils.llm import get_llm
+from ..utils.redaction import redact_sensitive_text
 from ..utils.shared_utils import extract_json_from_text
 from ..prompts import SYNTHESIS_SYSTEM_PROMPT, SYNTHESIS_USER_PROMPT
 from ..constants import BEDROCK_MODEL_ID
@@ -68,8 +69,7 @@ class SynthesisAgent:
         ])
         print("✅ Synthesis Agent initialized!")
     
-    def _create_llm(self) -> ChatBedrock:
-        print(f"Using shared Claude instance")
+    def _create_llm(self) -> BaseChatModel:
         return get_llm()
     
     def _format_prompt_variables(
@@ -99,15 +99,15 @@ class SynthesisAgent:
         
         return {
             "error_type": parsed_error.error_type,
-            "error_message": parsed_error.error_message[:300],
-            "failed_step": parsed_error.failed_step or "Unknown",
+            "error_message": redact_sensitive_text(parsed_error.error_message, limit=300),
+            "failed_step": redact_sensitive_text(parsed_error.failed_step or "Unknown"),
             "severity": triage_result.severity.value,
-            "root_cause": triage_result.root_cause,
-            "root_cause_detailed": triage_result.root_cause_detailed[:500],
+            "root_cause": redact_sensitive_text(triage_result.root_cause),
+            "root_cause_detailed": redact_sensitive_text(triage_result.root_cause_detailed, limit=500),
             "affected_files": ", ".join(triage_result.affected_files) if triage_result.affected_files else "Unknown",
             "error_category": triage_result.error_category_refined.value,
-            "web_findings": web_findings,
-            "research_solutions": research_solutions_str,
+            "web_findings": redact_sensitive_text(web_findings),
+            "research_solutions": redact_sensitive_text(research_solutions_str),
             "relevant_urls": relevant_urls
         }
     
@@ -292,4 +292,3 @@ class SynthesisAgent:
 
 
 # SCRIPT ENTRY POINT
-

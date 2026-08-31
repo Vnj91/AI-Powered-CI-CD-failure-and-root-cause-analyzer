@@ -1,6 +1,7 @@
 .git
 .github
 .venv
+.pytest_cache
 __pycache__
 *.pyc
 .env
@@ -12,5 +13,8 @@ models/*.json
 output
 *.md
 .devcontainer
+compose.yaml
+tests
+test_runner.py
 ci-cd-env
 .ci-cd-env

@@ -20,7 +20,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
-from langchain_aws import ChatBedrock
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 
 from ..tools.tavily_search import TavilySearchTool, SearchResponse
@@ -29,10 +29,12 @@ from ..tools.log_parser import ParsedError
 from .triage_agent import TriageResult
 
 from ..utils.llm import get_llm
+from ..utils.redaction import redact_sensitive_text
 from ..utils.shared_utils import parse_llm_json_response
 from ..prompts import RESEARCH_SYNTHESIS_PROMPT
 from ..constants import BEDROCK_MODEL_ID
 from ..utils.shared_utils import extract_json_from_text
+from config import Config
 
 
 class SolutionCandidate(BaseModel):
@@ -220,7 +222,8 @@ class ResearchAgent:
     def __init__(
         self,
         repo_name: Optional[str] = None,
-        model_id: str = BEDROCK_MODEL_ID
+        model_id: str = BEDROCK_MODEL_ID,
+        github_token: Optional[str] = None,
     ):
         """
         Initialize the Research Agent.
@@ -232,11 +235,11 @@ class ResearchAgent:
         self.repo_name = repo_name
         self.model_id = model_id
         
-        self.search_tool = TavilySearchTool()
+        self.search_tool = TavilySearchTool(api_key=Config.TAVILY_API_KEY) if Config.TAVILY_API_KEY else None
         self.code_fetcher = None
         if repo_name:
             try:
-                self.code_fetcher = CodeContextFetcher(repo_name)
+                self.code_fetcher = CodeContextFetcher(repo_name, token=github_token)
             except Exception as e:
                 print(f"Could not connect to repo: {e}")
         
@@ -245,8 +248,7 @@ class ResearchAgent:
             ("human", RESEARCH_SYNTHESIS_PROMPT)
         ])
     
-    def _create_llm(self) -> ChatBedrock:
-        print(f"Using shared Claude instance")
+    def _create_llm(self) -> BaseChatModel:
         return get_llm()
     
     def _generate_search_queries(
@@ -263,10 +265,10 @@ class ResearchAgent:
         
         # Use triage-provided queries if available
         if triage_result.research_queries:
-            queries.extend(triage_result.research_queries)
+            queries.extend(redact_sensitive_text(query) for query in triage_result.research_queries)
         
         # Always generate basic queries based on error
-        error_short = parsed_error.error_message[:50].replace("'", "").replace('"', '')
+        error_short = redact_sensitive_text(parsed_error.error_message, limit=50).replace("'", "").replace('"', '')
         
         queries.extend([
             f"{parsed_error.error_type} {error_short} fix",
@@ -301,6 +303,9 @@ class ResearchAgent:
         Returns:
             List of SearchResponse objects
         """
+        if self.search_tool is None:
+            return []
+
         print("\nPerforming Web Research...")
         print("-" * 40)
         
@@ -366,12 +371,12 @@ class ResearchAgent:
         
         if code_context:
             if code_context.requirements:
-                requirements_content = code_context.requirements[:800]
+                requirements_content = redact_sensitive_text(code_context.requirements, limit=800)
             
             if code_context.workflow_files:
                 wf_content = []
                 for wf in code_context.workflow_files[:2]:
-                    content = wf.content[:600].replace('`', "'")  # Replace backticks
+                    content = redact_sensitive_text(wf.content, limit=600).replace('`', "'")
                     wf_content.append(f"File: {wf.path}\n{content}")
                 workflow_content = "\n\n".join(wf_content)
             
@@ -379,9 +384,9 @@ class ResearchAgent:
         
         prompt_vars = {
             "error_type": parsed_error.error_type,
-            "error_message": parsed_error.error_message[:200],
-            "root_cause": triage_result.root_cause,
-            "web_findings": web_findings_text[:3000],  # Limit size
+            "error_message": redact_sensitive_text(parsed_error.error_message, limit=200),
+            "root_cause": redact_sensitive_text(triage_result.root_cause),
+            "web_findings": redact_sensitive_text(web_findings_text, limit=3000),
             "repo_name": self.repo_name or "Not specified",
             "relevant_files": ", ".join(relevant_files) if relevant_files else "None found",
             "requirements_content": requirements_content,
@@ -474,5 +479,3 @@ class ResearchAgent:
         )
         
         return result
-
-

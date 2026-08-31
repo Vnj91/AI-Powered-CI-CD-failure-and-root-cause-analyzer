@@ -232,40 +232,46 @@ def analyze_culprit_for_repository(
     parsed_error: Optional[ParsedError] = None,
     error_category: Optional[str] = None,
     failed_step: Optional[str] = None,
+    workflow_run_id: Optional[int] = None,
+    github_token: Optional[str] = None,
 ) -> CulpritCommitResult:
-    """Fetch failed-run commit context from GitHub and score likely culprit."""
+    """Fetch failed-run commit context from GitHub and score likely culprit.
 
-    try:
-        from ..tools.github_loader import get_latest_workflow_run, get_github_client
-    except Exception:
+    When ingestion supplies a run ID, use that exact run so a new failure
+    arriving mid-analysis cannot change the commit being evaluated.
+    """
+
+    # This enhancement is invoked after authenticated Actions-log retrieval in
+    # the dashboard. Avoid an unexpected anonymous network call in offline or
+    # test-only graph executions.
+    from config import Config
+
+    if not github_token and not Config.GITHUB_ACCESS_TOKEN:
         return CulpritCommitResult()
 
     try:
-        latest_run = get_latest_workflow_run(repo_name)
-        if latest_run is None:
+        from ..integrations.github_automation import GitHubAutomationService
+
+        automation = GitHubAutomationService(token=github_token, repository=repo_name)
+        failed_run = (
+            automation.get_workflow_run(int(workflow_run_id), repository=repo_name)
+            if workflow_run_id is not None
+            else automation.get_latest_failed_run(repo_name, include_system_workflows=True)
+        )
+        if failed_run is None or not failed_run.head_sha:
             return CulpritCommitResult()
 
-        commit_sha = getattr(latest_run, "head_sha", None)
-        if not commit_sha:
-            return CulpritCommitResult()
-
-        client = get_github_client()
-        repo = client.get_repo(repo_name)
-        commit = repo.get_commit(commit_sha)
-        changed_files = [item.filename for item in getattr(commit, "files", []) or [] if getattr(item, "filename", None)]
-        message = getattr(getattr(commit, "commit", None), "message", "") or ""
-        author = getattr(getattr(commit, "author", None), "login", None) or ""
+        commit = automation.get_commit_changes(failed_run.head_sha, repository=repo_name)
 
         analyzer = CommitAnalyzer()
         return analyzer.analyze_failed_run(
-            commit_sha=commit_sha,
-            changed_files=changed_files,
-            commit_message=message,
-            author=author,
+            commit_sha=commit.sha,
+            changed_files=commit.changed_files,
+            commit_message=commit.message,
+            author=commit.author_login or commit.author_name or "",
             parsed_error=parsed_error,
             error_category=error_category,
             failed_step=failed_step,
         )
     except Exception:
         return CulpritCommitResult()
-

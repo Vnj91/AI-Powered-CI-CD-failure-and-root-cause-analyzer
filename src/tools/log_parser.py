@@ -159,7 +159,7 @@ class LogPatterns:
     - .* = any characters (greedy)
     - .*? = any characters (non-greedy/lazy)
     - (?P<name>...) = named capture group
-    - \d+ = one or more digits
+    - \\d+ = one or more digits
     """
     
     # GitHub Actions timestamp pattern
@@ -167,6 +167,9 @@ class LogPatterns:
     TIMESTAMP = re.compile(
         r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s*'
     )
+
+    # ANSI/VT100 terminal formatting emitted by test runners and compilers.
+    ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     
     # GitHub Actions special markers
     GH_ERROR = re.compile(r'##\[error\](.+)$', re.MULTILINE)
@@ -212,8 +215,14 @@ class LogPatterns:
     )
     
     # Test failure patterns (pytest, jest, etc.)
-    PYTEST_FAILED = re.compile(r'FAILED\s+(\S+)', re.MULTILINE)
-    ASSERTION_ERROR = re.compile(r'AssertionError:\s*(.+)$', re.MULTILINE)
+    PYTEST_FAILED = re.compile(
+        r'^FAILED\s+(?P<test>\S+)(?:\s+-\s+(?P<message>.+))?$',
+        re.MULTILINE,
+    )
+    ASSERTION_ERROR = re.compile(
+        r'^\s*(?:E\s+)?AssertionError(?:\s*:\s*(?P<message>.*))?\s*$',
+        re.MULTILINE,
+    )
     
     # Failed step name (from GitHub Actions)
     # Example: "Run npm test" or "Run python -c ..."
@@ -245,6 +254,12 @@ def remove_timestamps(log_content: str) -> str:
         cleaned_lines.append(cleaned)
     
     return '\n'.join(cleaned_lines)
+
+
+def remove_ansi_sequences(log_content: str) -> str:
+    """Remove terminal colour/control sequences before pattern matching."""
+
+    return LogPatterns.ANSI_ESCAPE.sub('', log_content)
 
 
 def classify_error(error_type: str, error_message: str) -> ErrorCategory:
@@ -288,10 +303,16 @@ def classify_error(error_type: str, error_message: str) -> ErrorCategory:
     if 'permission' in error_type_lower or 'permission denied' in message_lower:
         return ErrorCategory.PERMISSION
     
+    # Timeouts are distinct from general network failures and need to be
+    # checked first because ``TimeoutError`` also contains a network hint in
+    # the legacy rule below.
+    if 'timeout' in error_type_lower or 'timed out' in message_lower or 'timeout' in message_lower:
+        return ErrorCategory.TIMEOUT
+
     # Network errors
-    if any(x in error_type_lower for x in ['connection', 'timeout', 'network']):
+    if any(x in error_type_lower for x in ['connection', 'network']):
         return ErrorCategory.NETWORK
-    if any(x in message_lower for x in ['connection refused', 'network', 'timeout']):
+    if any(x in message_lower for x in ['connection refused', 'network']):
         return ErrorCategory.NETWORK
     
     # File errors
@@ -402,8 +423,10 @@ class LogParser:
         """
         total_lines = log_content.count('\n') + 1
         
-        # Clean the logs (remove timestamps for easier parsing)
-        cleaned_content = remove_timestamps(log_content)
+        # Clean the logs (remove terminal formatting and timestamps for easier
+        # parsing). ANSI colour codes otherwise split exception names and keep
+        # anchored regexes from matching common pytest/compiler output.
+        cleaned_content = remove_timestamps(remove_ansi_sequences(log_content))
         
         errors: list[ParsedError] = []
         
@@ -464,8 +487,41 @@ class LogParser:
                     exit_code=exit_code,
                     relevant_lines=npm_errors[:10]  # Keep first 10 npm error lines
                 ))
+
+        # STEP 4: Find pytest summary failures and bare AssertionError output.
+        # Pytest commonly emits these without a ``Type: message`` exception
+        # line, so the Python exception parser above cannot see them.
+        if not errors:
+            pytest_failures = list(LogPatterns.PYTEST_FAILED.finditer(cleaned_content))
+            for match in pytest_failures[:3]:
+                test_name = match.group('test')
+                detail = (match.group('message') or '').strip()
+                error_message = f"{test_name} failed"
+                if detail:
+                    error_message = f"{error_message}: {detail}"
+                errors.append(ParsedError(
+                    error_type="PytestFailure",
+                    error_message=error_message,
+                    error_category=ErrorCategory.TEST_FAILURE,
+                    failed_step=self._find_failed_step(cleaned_content, match.start()),
+                    exit_code=exit_code,
+                    raw_error_block=self._extract_error_block(cleaned_content, match.start()),
+                ))
+
+        if not errors:
+            assertion_match = LogPatterns.ASSERTION_ERROR.search(cleaned_content)
+            if assertion_match:
+                detail = (assertion_match.group('message') or '').strip()
+                errors.append(ParsedError(
+                    error_type="AssertionError",
+                    error_message=detail or "Assertion failed",
+                    error_category=ErrorCategory.TEST_FAILURE,
+                    failed_step=self._find_failed_step(cleaned_content, assertion_match.start()),
+                    exit_code=exit_code,
+                    raw_error_block=self._extract_error_block(cleaned_content, assertion_match.start()),
+                ))
         
-        # STEP 4: Find generic errors (if nothing else found)
+        # STEP 5: Find generic errors (if nothing else found)
         if not errors:
             generic_errors = LogPatterns.GENERIC_ERROR.findall(cleaned_content)
             
@@ -477,7 +533,7 @@ class LogParser:
                     exit_code=exit_code
                 ))
         
-        # STEP 5: Fallback - use GitHub ##[error] markers
+        # STEP 6: Fallback - use GitHub ##[error] markers
         if not errors and gh_errors:
             for gh_error in gh_errors:
                 # Skip generic "Process completed with exit code" errors
@@ -490,8 +546,22 @@ class LogParser:
                     error_category=ErrorCategory.UNKNOWN,
                     exit_code=exit_code
                 ))
+
+        # STEP 7: Preserve an actionable error for tools that only report a
+        # non-zero process exit code. This is intentionally classified as
+        # unknown because an exit code alone cannot establish a root cause.
+        if not errors and exit_code is not None and exit_code != 0:
+            error_position = exit_code_match.start() if exit_code_match else len(cleaned_content)
+            errors.append(ParsedError(
+                error_type="ProcessExitError",
+                error_message=f"Process completed with exit code {exit_code}",
+                error_category=ErrorCategory.UNKNOWN,
+                failed_step=self._find_failed_step(cleaned_content, error_position),
+                exit_code=exit_code,
+                raw_error_block=self._extract_error_block(cleaned_content, error_position),
+            ))
         
-        # STEP 6: Create result
+        # STEP 8: Create result
         primary_error = errors[0] if errors else None
         
         # Generate summary
@@ -581,6 +651,4 @@ def parse_log_content(content: str) -> LogParseResult:
     """
     parser = LogParser()
     return parser.parse_content(content)
-
-
 

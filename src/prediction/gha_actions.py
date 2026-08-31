@@ -19,13 +19,33 @@ MODEL_ARTIFACT_NAME = Config.MODEL_ARTIFACT_NAME
 PREDICTION_HISTORY_ARTIFACT_NAME = Config.PREDICTION_HISTORY_ARTIFACT_NAME
 
 
+def _prediction_branch() -> str:
+    """Resolve the real branch name without dropping slash-delimited prefixes."""
+
+    head_ref = os.environ.get("GITHUB_HEAD_REF", "").strip()
+    if head_ref:
+        return head_ref
+
+    ref = os.environ.get("GITHUB_REF", "").strip()
+    prefix = "refs/heads/"
+    if ref.startswith(prefix):
+        return ref[len(prefix) :]
+    return ref or "main"
+
+
+def _target_workflow_name() -> str:
+    """Return the application workflow whose outcome this prediction targets."""
+
+    return os.environ.get("TARGET_WORKFLOW_NAME", "").strip() or "CI/CD Pipeline"
+
+
 def run_pre_ci_prediction() -> int:
     """Run leakage-safe pre-CI prediction. Always exits 0 unless unexpected crash."""
 
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     sha = os.environ.get("GITHUB_SHA", "")
-    ref = os.environ.get("GITHUB_REF", "")
-    branch = ref.split("/")[-1] if ref else "main"
+    branch = _prediction_branch()
+    workflow_name = _target_workflow_name()
     run_id_raw = os.environ.get("GITHUB_RUN_ID")
     run_id = int(run_id_raw) if run_id_raw else None
     token = os.environ.get("GITHUB_ACCESS_TOKEN")
@@ -70,6 +90,7 @@ def run_pre_ci_prediction() -> int:
             repository=repo,
             commit_sha=sha,
             branch=branch,
+            workflow_name=workflow_name,
         )
     except Exception as exc:
         print(f"Prediction skipped — could not build features: {exc.__class__.__name__}")
@@ -86,7 +107,7 @@ def run_pre_ci_prediction() -> int:
     )
     prediction, prediction_id = service.predict_and_record(
         repository=repo,
-        workflow="Pre-CI Failure Prediction",
+        workflow=workflow_name,
         run_id=run_id,
         commit_sha=sha,
         features=feature_row,

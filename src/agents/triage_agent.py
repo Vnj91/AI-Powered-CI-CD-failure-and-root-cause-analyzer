@@ -7,7 +7,7 @@ This agent analyzes parsed CI/CD errors and provides:
 - Initial fix suggestions
 - Determination of whether further research is needed
 
-Uses Claude via AWS Bedrock for intelligent analysis.
+Uses the configured optional LLM provider for enriched analysis.
 """
 
 import json
@@ -17,10 +17,11 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_aws import ChatBedrock
+from langchain_core.language_models.chat_models import BaseChatModel
 
 from ..tools.log_parser import ParsedError, ErrorCategory
 from ..utils.llm import get_llm
+from ..utils.redaction import redact_sensitive_text
 from ..prompts import TRIAGE_SYSTEM_PROMPT, TRIAGE_USER_PROMPT
 from ..constants import BEDROCK_MODEL_ID
 
@@ -113,8 +114,7 @@ class TriageAgent:
         self.llm = self._create_llm()
         self.prompt = self._create_prompt()
     
-    def _create_llm(self) -> ChatBedrock:
-        print(f"Using shared Claude instance")
+    def _create_llm(self) -> BaseChatModel:
         return get_llm()
     
     def _create_prompt(self) -> ChatPromptTemplate:
@@ -134,12 +134,17 @@ class TriageAgent:
         
         return {
             "error_type": error.error_type,
-            "error_message": error.error_message,
+            "error_message": redact_sensitive_text(error.error_message),
             "error_category": error.error_category.value if error.error_category else "unknown",
-            "failed_step": error.failed_step or "Unknown",
+            "failed_step": redact_sensitive_text(error.failed_step or "Unknown"),
             "exit_code": error.exit_code or "Unknown",
-            "stack_trace": "\n".join(error.stack_trace) if error.stack_trace else "No stack trace available",
-            "raw_error_block": error.raw_error_block[:2000] if error.raw_error_block else "No additional context"
+            "stack_trace": redact_sensitive_text(
+                "\n".join(error.stack_trace) if error.stack_trace else "No stack trace available"
+            ),
+            "raw_error_block": redact_sensitive_text(
+                error.raw_error_block if error.raw_error_block else "No additional context",
+                limit=2000,
+            ),
         }
     
     def _parse_llm_response(self, response_text: str) -> TriageResult:
@@ -194,13 +199,11 @@ class TriageAgent:
         print("Formatted!")
         chain = self.prompt | self.llm
         
-        print("\n Sending to claude for analysis..")
+        print("\n Sending to the configured LLM for analysis..")
         response = chain.invoke(prompts_vars)
-        print("\n Recieved res from claude")
+        print("\n Received response from the configured LLM")
         
         result = self._parse_llm_response(response.content)
         
         return result
-
-
 

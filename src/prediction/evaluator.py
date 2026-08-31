@@ -116,13 +116,19 @@ def evaluate_saved_model(
     dataset = dataset.sort_values(sort_columns, kind="mergesort").reset_index(drop=True)
     features, labels = FailureFeatureExtractor.prepare_training_frame(dataset, target_column=target_column)
 
-    split_index = max(1, int(len(dataset) * (1 - test_fraction)))
-    split_index = min(split_index, len(dataset) - 1)
+    artifact = joblib.load(model_path)
+    split_index = int(
+        artifact.get(
+            "split_index",
+            min(max(1, int(len(dataset) * (1 - test_fraction))), len(dataset) - 1),
+        )
+    )
+    if not 0 < split_index < len(dataset):
+        raise ValueError("Saved model contains an invalid temporal split index")
 
     X_test = features.iloc[split_index:].reset_index(drop=True)
     y_test = labels.iloc[split_index:].reset_index(drop=True)
 
-    artifact = joblib.load(model_path)
     pipeline = artifact["pipeline"]
 
     predictions = pipeline.predict(X_test)

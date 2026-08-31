@@ -1,0 +1,55 @@
+name: cicd-root-cause-analyzer
+
+services:
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cicd-root-cause-analyzer:local
+    container_name: cicd-root-cause-analyzer
+    init: true
+    restart: unless-stopped
+    environment:
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_PROFILE: ${AWS_PROFILE:-}
+      BEDROCK_MODEL_ID: ${BEDROCK_MODEL_ID:-anthropic.claude-3-5-sonnet-20240620-v1:0}
+      LLM_PROVIDER: ${LLM_PROVIDER:-none}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+      OLLAMA_REQUEST_TIMEOUT_SECONDS: ${OLLAMA_REQUEST_TIMEOUT_SECONDS:-60}
+      GITHUB_ACCESS_TOKEN: ${GITHUB_ACCESS_TOKEN:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      APP_PASSWORD: ${APP_PASSWORD:-}
+      ALLOWED_REPOSITORIES: ${ALLOWED_REPOSITORIES:-}
+      DEFAULT_REPOSITORY: ${DEFAULT_REPOSITORY:-Vnj91/AI-Powered-CI-CD-failure-and-root-cause-analyzer}
+      PORT: "8501"
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+    ports:
+      - "${APP_HOST_PORT:-8501}:8501"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - analyzer-data:/home/appuser/app/data
+      - analyzer-models:/home/appuser/app/models
+      - analyzer-output:/home/appuser/app/output
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8501/_stcore/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+
+volumes:
+  analyzer-data:
+  analyzer-models:
+  analyzer-output:

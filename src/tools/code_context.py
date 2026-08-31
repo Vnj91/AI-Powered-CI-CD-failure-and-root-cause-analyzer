@@ -13,7 +13,6 @@ from pydantic import BaseModel, Field
 from github import Github, Auth, GithubException
 
 load_dotenv()
-GITHUB_ACCESS_TOKEN = os.getenv("GITHUB_ACCESS_TOKEN")
 
 
 class CodeFile(BaseModel):
@@ -84,14 +83,14 @@ class CodeContextFetcher:
         "docker-compose.yml",
     ]
     
-    def __init__(self, repo_name: str):
-
-        if not GITHUB_ACCESS_TOKEN:
-            raise ValueError("GITHUB_ACCESS_TOKEN not found in environment")
-        
+    def __init__(self, repo_name: str, token: Optional[str] = None):
         self.repo_name = repo_name
-        auth = Auth.Token(GITHUB_ACCESS_TOKEN)
-        self.github = Github(auth=auth)
+        configured_token = str(token or os.getenv("GITHUB_ACCESS_TOKEN") or "").strip()
+        self.github = (
+            Github(auth=Auth.Token(configured_token), retry=0, timeout=20)
+            if configured_token
+            else Github(retry=0, timeout=20)
+        )
         
         try:
             self.repo = self.github.get_repo(repo_name)
@@ -281,5 +280,4 @@ class CodeContextFetcher:
         print(f"   - {len(structure)} items in structure")
         
         return context
-
 

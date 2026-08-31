@@ -146,7 +146,7 @@ def main() -> None:
             print(f"Model not found: {args.model}")
             sys.exit(1)
         metrics = evaluate_saved_model(args.dataset, args.model)
-        print(metrics.model_dump_json(indent=2, default=str))
+        print(metrics.model_dump_json(indent=2))
         print(json.dumps({
             "class_distribution": {
                 "success": report.success_runs,

@@ -55,7 +55,7 @@ class FailurePredictionService:
     ) -> tuple[FailurePrediction, Optional[str]]:
         prediction = self.predict(features)
 
-        if not self.history_store:
+        if not self.history_store or not prediction.model_available:
             return prediction, None
 
         prediction_id = self.history_store.append_prediction(

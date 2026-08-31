@@ -3,14 +3,37 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
+from functools import wraps
 from pathlib import Path
+from threading import Lock, RLock
 from typing import Optional
 
 import pandas as pd
 
 from .category_mapper import conclusion_to_actual_failure, conclusion_to_outcome_label
 from .schemas import PredictionHistoryRecord, FailurePrediction
+
+
+_LOCKS_GUARD = Lock()
+_HISTORY_LOCKS: dict[Path, RLock] = {}
+
+
+def _lock_for(path: Path) -> RLock:
+    resolved = path.resolve()
+    with _LOCKS_GUARD:
+        return _HISTORY_LOCKS.setdefault(resolved, RLock())
+
+
+def _synchronized(method):
+    """Serialize read-modify-write transactions for one history path."""
+
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 class PredictionHistoryStore:
@@ -36,6 +59,7 @@ class PredictionHistoryStore:
     def __init__(self, history_path: str | Path):
         self.history_path = Path(history_path)
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = _lock_for(self.history_path)
 
     def _load(self) -> pd.DataFrame:
         if not self.history_path.exists():
@@ -47,7 +71,14 @@ class PredictionHistoryStore:
         return self._coerce_object_columns(frame)
 
     def _save(self, frame: pd.DataFrame) -> None:
-        frame.to_csv(self.history_path, index=False)
+        temporary = self.history_path.with_name(
+            f".{self.history_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            frame.to_csv(temporary, index=False)
+            temporary.replace(self.history_path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _coerce_object_columns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -85,13 +116,35 @@ class PredictionHistoryStore:
         if frame.empty:
             return None
 
-        mask = (
-            frame["repository"].astype(str) == repository
-        ) & (
-            frame["commit_sha"].astype(str).str.startswith(str(commit_sha)[:7])
-        )
+        target_sha = str(commit_sha or "").strip().lower()
+        if len(target_sha) < 7:
+            return None
+
+        repository_mask = frame["repository"].astype(str).str.casefold() == repository.casefold()
+        stored_shas = frame["commit_sha"].fillna("").astype(str).str.strip().str.lower()
+        # Prefer an exact full SHA. Prefix matching is retained only for legacy
+        # history rows that genuinely stored an abbreviated SHA.
+        sha_mask = stored_shas == target_sha
+        exact_match_found = bool(sha_mask.any())
+        if not exact_match_found:
+            sha_mask = stored_shas.map(
+                lambda stored: (
+                    len(stored) >= 7
+                    and (len(stored) < 40 or len(target_sha) < 40)
+                    and (stored.startswith(target_sha) or target_sha.startswith(stored))
+                )
+            )
+
+        mask = repository_mask & sha_mask
         if workflow:
             mask &= frame["workflow"].astype(str) == workflow
+
+        if not exact_match_found:
+            complete_candidates = {
+                value for value in stored_shas[mask].tolist() if len(value) >= 40
+            }
+            if len(complete_candidates) > 1:
+                return None
 
         pending = frame[mask & frame["actual_failure"].isna()]
         if pending.empty:
@@ -100,6 +153,7 @@ class PredictionHistoryStore:
             return None
         return pending.iloc[-1]
 
+    @_synchronized
     def append_prediction(
         self,
         repository: str,
@@ -122,7 +176,7 @@ class PredictionHistoryStore:
         prediction_id = str(uuid.uuid4())
         record = PredictionHistoryRecord(
             prediction_id=prediction_id,
-            timestamp=timestamp or datetime.utcnow(),
+            timestamp=timestamp or datetime.now(UTC),
             repository=repository,
             workflow=workflow,
             run_id=run_id,
@@ -133,7 +187,7 @@ class PredictionHistoryStore:
             actual_failure=actual_failure,
             actual_category=actual_category,
             actual_conclusion=actual_conclusion,
-            feedback_recorded_at=datetime.utcnow() if actual_failure is not None else None,
+            feedback_recorded_at=datetime.now(UTC) if actual_failure is not None else None,
             model_version=prediction.model_version,
         )
 
@@ -142,6 +196,7 @@ class PredictionHistoryStore:
         self._save(updated)
         return prediction_id
 
+    @_synchronized
     def update_actual_outcome(
         self,
         prediction_id: str,
@@ -163,11 +218,12 @@ class PredictionHistoryStore:
             frame.loc[mask, "actual_category"] = actual_category
         if actual_conclusion is not None:
             frame.loc[mask, "actual_conclusion"] = actual_conclusion
-        frame.loc[mask, "feedback_recorded_at"] = datetime.utcnow().isoformat()
+        frame.loc[mask, "feedback_recorded_at"] = datetime.now(UTC).isoformat()
 
         self._save(frame)
         return True
 
+    @_synchronized
     def record_outcome_by_run_id(
         self,
         run_id: int,
@@ -196,7 +252,7 @@ class PredictionHistoryStore:
 
         if actual_failure is None:
             frame.loc[mask, "actual_conclusion"] = outcome_label
-            frame.loc[mask, "feedback_recorded_at"] = datetime.utcnow().isoformat()
+            frame.loc[mask, "feedback_recorded_at"] = datetime.now(UTC).isoformat()
             self._save(frame)
             return True, prediction_id, "recorded_non_binary_outcome"
 
@@ -204,10 +260,11 @@ class PredictionHistoryStore:
         frame.loc[mask, "actual_conclusion"] = outcome_label
         if actual_category is not None:
             frame.loc[mask, "actual_category"] = actual_category
-        frame.loc[mask, "feedback_recorded_at"] = datetime.utcnow().isoformat()
+        frame.loc[mask, "feedback_recorded_at"] = datetime.now(UTC).isoformat()
         self._save(frame)
         return True, prediction_id, "recorded"
 
+    @_synchronized
     def record_outcome_for_commit(
         self,
         repository: str,
@@ -239,7 +296,7 @@ class PredictionHistoryStore:
             frame.loc[mask, "actual_conclusion"] = outcome_label
             if run_id is not None:
                 frame.loc[mask, "run_id"] = int(run_id)
-            frame.loc[mask, "feedback_recorded_at"] = datetime.utcnow().isoformat()
+            frame.loc[mask, "feedback_recorded_at"] = datetime.now(UTC).isoformat()
             self._save(frame)
             return True, prediction_id, "recorded_non_binary_outcome"
 

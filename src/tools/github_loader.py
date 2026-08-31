@@ -17,12 +17,14 @@ from dotenv import load_dotenv
 from github import Github, Auth, GithubException
 from github.WorkflowRun import WorkflowRun
 
+from config import Config
+
 load_dotenv()
 
 GITHUB_TOKEN : Optional[str] = os.getenv("GITHUB_ACCESS_TOKEN")
 
 # default o/p directory for logs
-OUTPUT_DIR = Path("output")
+OUTPUT_DIR = Config.OUTPUT_DIR
 
 
 # helper functions 
@@ -77,7 +79,7 @@ def get_latest_workflow_run(repo_name : str) -> Optional[WorkflowRun]:
         raise ValueError(f"GitHub API error: {e.data.get('message', str(e))}")
     
     workflow_runs = repo.get_workflow_runs(status="completed")
-    print("Searching for failed workflow runs......")
+    print("Searching for the latest completed workflow run......")
     
     try:
         latest_run = next(iter(workflow_runs))
@@ -87,12 +89,41 @@ def get_latest_workflow_run(repo_name : str) -> Optional[WorkflowRun]:
     
     return latest_run
 
-def download_worflow_logs(run : WorkflowRun, output_filename: str = "build_log.txt") -> Path:
+
+def get_latest_failed_workflow_run(repo_name: str) -> Optional[WorkflowRun]:
+    """Fetch the most recent workflow run whose conclusion is ``failure``.
+
+    GitHub's workflow-runs endpoint accepts a conclusion value in its ``status``
+    filter.  Asking for failures directly avoids the old behaviour where a
+    successful run newer than the last failure caused RCA to report that there
+    was nothing to analyze.
+    """
+
+    client = get_github_client()
+
+    try:
+        repo = client.get_repo(repo_name)
+    except GithubException as e:
+        if e.status == 404:
+            raise ValueError(f"Repository '{repo_name}' not found. Check the name and your access.")
+        raise ValueError(f"GitHub API error: {e.data.get('message', str(e))}")
+
+    print("Searching for the latest failed workflow run......")
+    failed_runs = repo.get_workflow_runs(status="failure")
+    try:
+        return next(iter(failed_runs))
+    except StopIteration:
+        print("ℹ️  No failed workflow runs found in this repository.")
+        return None
+
+
+def download_worflow_logs(run : WorkflowRun, output_filename: Optional[str] = None) -> Path:
     """Download logs for a given workflow run and save to output file.
     
     Args:
         run (WorkflowRun): The workflow run to fetch logs for.
-        output_filename (str): The name of the output log file.
+        output_filename (str): The name of the output log file. When omitted,
+            a run-specific filename is used to avoid cross-run overwrites.
         
     Returns:
         Path : Path to saved file
@@ -104,6 +135,8 @@ def download_worflow_logs(run : WorkflowRun, output_filename: str = "build_log.t
     """
     
     ensure_output_dir()
+    if output_filename is None:
+        output_filename = f"build_log_{run.id}.txt"
     output_path = OUTPUT_DIR / output_filename
     print(f"Downloading logs for run ID {run.id}...")
     
@@ -112,7 +145,7 @@ def download_worflow_logs(run : WorkflowRun, output_filename: str = "build_log.t
     
     # Download the logs zip file.    
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    response = requests.get(logs_url, headers=headers, stream=True)
+    response = requests.get(logs_url, headers=headers, stream=True, timeout=60)
     
     if response.status_code != 200:
         raise RuntimeError(
@@ -174,27 +207,10 @@ def fetch_failed_build_logs(repo_name : str) -> Optional[Path]:
         Path to the log file, or None if no failures found
     """
     
-    latest_run  = get_latest_workflow_run(repo_name=repo_name)
+    latest_run = get_latest_failed_workflow_run(repo_name)
     
     if not latest_run :
         return None
     
-    if latest_run.conclusion == "success":
-        print("Your CI/CD pipeline is healthy. Nothing to analyze.")
-        return None
-    
-    elif latest_run.conclusion == "failure":
-        print("Build failed! Proceeding to download logs for analysis...")
-        
-        log_path = download_worflow_logs(latest_run)
-        return log_path
-    
-    else:
-        print(f"\n⚠️  Build conclusion is '{latest_run.conclusion}' (not a failure).")
-        print("   No analysis needed.")
-        return None
-    
-
-
-    
-    
+    print("Build failed! Proceeding to download logs for analysis...")
+    return download_worflow_logs(latest_run)

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 import joblib
 import pandas as pd
@@ -15,6 +16,30 @@ from sklearn.pipeline import Pipeline
 
 from .evaluator import evaluate_classifier, evaluate_multiclass_classifier
 from .feature_extractor import FailureFeatureExtractor
+
+
+def _atomic_joblib_dump(value: object, path: Path) -> None:
+    """Replace a model artifact only after serialization completes."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        joblib.dump(value, temporary)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_json(value: object, path: Path) -> None:
+    """Atomically replace model metadata."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(value, indent=2, default=str), encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class FailurePredictorTrainer:
@@ -49,6 +74,33 @@ class FailurePredictorTrainer:
         )
 
     @staticmethod
+    def _select_temporal_split(labels: pd.Series, test_fraction: float) -> int:
+        """Choose the nearest chronological split with usable classes on both sides."""
+
+        desired = max(1, int(len(labels) * (1 - test_fraction)))
+        desired = min(desired, len(labels) - 1)
+        classes = set(labels.dropna().unique().tolist())
+        candidates: list[int] = []
+        for index in range(1, len(labels)):
+            train_counts = labels.iloc[:index].value_counts()
+            test_counts = labels.iloc[index:].value_counts()
+            if (
+                set(train_counts.index.tolist()) == classes
+                and set(test_counts.index.tolist()) == classes
+                and int(train_counts.min()) >= 2
+                and int(test_counts.min()) >= 2
+            ):
+                candidates.append(index)
+
+        if not candidates:
+            raise ValueError(
+                "Temporal training split must contain at least two classes in both "
+                "the training prefix and holdout, with at least two examples per class. "
+                "Collect more chronologically varied outcomes before training."
+            )
+        return min(candidates, key=lambda index: (abs(index - desired), -index))
+
+    @staticmethod
     def _sort_time_ordered_frame(frame: pd.DataFrame) -> pd.DataFrame:
         sort_columns = ["_timestamp"]
         if "run_id" in frame.columns:
@@ -65,8 +117,7 @@ class FailurePredictorTrainer:
         if labels.nunique() < 2:
             raise ValueError("Training data must contain at least two classes")
 
-        split_index = max(1, int(len(features) * (1 - test_fraction)))
-        split_index = min(split_index, len(features) - 1)
+        split_index = self._select_temporal_split(labels, test_fraction)
 
         X_train = features.iloc[:split_index].reset_index(drop=True)
         y_train = labels.iloc[:split_index].reset_index(drop=True)
@@ -132,7 +183,11 @@ class FailurePredictorTrainer:
                 "unique_categories": int(labels.nunique()),
             }
 
-        features = category_frame.reindex(columns=feature_columns, fill_value=0).fillna(0)
+        features, _ = FailureFeatureExtractor.prepare_training_frame(
+            category_frame,
+            target_column="actual_failure",
+        )
+        features = features.reindex(columns=feature_columns, fill_value=0).fillna(0)
         timestamps = pd.to_datetime(category_frame["_timestamp"], errors="coerce")
 
         split_index = max(1, int(len(features) * (1 - test_fraction)))
@@ -142,6 +197,24 @@ class FailurePredictorTrainer:
         y_train = labels.iloc[:split_index].reset_index(drop=True)
         X_test = features.iloc[split_index:].reset_index(drop=True)
         y_test = labels.iloc[split_index:].reset_index(drop=True)
+
+        all_categories = set(labels.unique().tolist())
+        training_categories = set(y_train.unique().tolist())
+        missing_categories = sorted(all_categories - training_categories)
+        if len(training_categories) < 2 or missing_categories:
+            reason = "Temporal category training split lacks required category classes"
+            if missing_categories:
+                reason += f": {', '.join(missing_categories)}"
+            return {
+                "available": False,
+                "trained": False,
+                "reason": reason,
+                "rows": int(len(category_frame)),
+                "unique_categories": int(len(all_categories)),
+                "training_categories": sorted(training_categories),
+                "missing_categories": missing_categories,
+                "split_index": int(split_index),
+            }
 
         pipeline = self._build_pipeline()
         pipeline.fit(X_train, y_train)
@@ -160,20 +233,19 @@ class FailurePredictorTrainer:
         artifact = {
             "pipeline": pipeline,
             "feature_columns": feature_columns,
-            "trained_at": datetime.utcnow().isoformat(),
+            "trained_at": datetime.now(UTC).isoformat(),
             "target_column": "actual_category",
             "metrics": metrics,
             "class_labels": sorted(labels.astype(str).unique().tolist()),
             "feature_version": 1,
             "random_state": self.random_state,
+            "split_index": int(split_index),
         }
 
         model_path = Path(model_path)
         metadata_path = Path(metadata_path)
-        model_path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(artifact, model_path)
-        metadata_path.parent.mkdir(parents=True, exist_ok=True)
-        metadata_path.write_text(json.dumps(artifact["metrics"], indent=2, default=str), encoding="utf-8")
+        _atomic_joblib_dump(artifact, model_path)
+        _atomic_write_json(artifact["metrics"], metadata_path)
 
         return {
             "available": True,
@@ -207,6 +279,12 @@ class FailurePredictorTrainer:
         timestamps = self._parse_timestamp_series(dataset)
         dataset = self._sort_time_ordered_frame(dataset.assign(_timestamp=timestamps))
 
+        if target_column not in dataset.columns:
+            raise ValueError(f"Target column '{target_column}' not found in dataset")
+        raw_labels = pd.to_numeric(dataset[target_column], errors="coerce")
+        if raw_labels.isna().any() or set(raw_labels.unique().tolist()) != {0, 1}:
+            raise ValueError("Training target must contain only non-null binary labels 0 and 1")
+
         features, labels = FailureFeatureExtractor.prepare_training_frame(dataset, target_column=target_column)
 
         if labels.nunique() < 2:
@@ -222,19 +300,17 @@ class FailurePredictorTrainer:
         artifact = {
             "pipeline": pipeline,
             "feature_columns": FailureFeatureExtractor.feature_columns(),
-            "trained_at": datetime.utcnow().isoformat(),
+            "trained_at": datetime.now(UTC).isoformat(),
             "target_column": target_column,
             "metrics": metrics,
             "class_labels": [0, 1],
             "feature_version": 1,
             "random_state": self.random_state,
+            "split_index": int(split_index),
         }
 
-        model_path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(artifact, model_path)
-
-        metadata_path.parent.mkdir(parents=True, exist_ok=True)
-        metadata_path.write_text(json.dumps(artifact["metrics"], indent=2, default=str), encoding="utf-8")
+        _atomic_joblib_dump(artifact, model_path)
+        _atomic_write_json(artifact["metrics"], metadata_path)
 
         category_model_path = (
             Path(category_model_path)

@@ -113,6 +113,22 @@ def test_dataset_validator_warns_on_single_class():
     assert any("one outcome class" in warning for warning in report.warnings)
 
 
+def test_dataset_validator_rejects_non_binary_failure_labels():
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=20, freq="D"),
+            "actual_failure": [0, 1] * 9 + [0, 2],
+            "run_id": list(range(20)),
+        }
+    )
+
+    report = validate_dataset(frame)
+
+    assert report.sufficient_for_training is False
+    assert report.other_runs == 1
+    assert any("binary labels" in warning for warning in report.warnings)
+
+
 def test_feedback_idempotent_by_run_id(tmp_path):
     store = PredictionHistoryStore(tmp_path / "history.csv")
     prediction = FailurePrediction(
@@ -209,6 +225,40 @@ def test_history_store_pending_commit_lookup(tmp_path):
     assert ok and pid and status == "recorded"
 
 
+def test_history_store_refuses_ambiguous_abbreviated_sha(tmp_path):
+    store = PredictionHistoryStore(tmp_path / "history.csv")
+    prediction = FailurePrediction(
+        model_available=True,
+        failure_probability=0.4,
+        predicted_failure=False,
+        risk_level="LOW",
+        model_version="test",
+    )
+    store.append_prediction("owner/repo", "ci", None, "deadbee" + "1" * 33, prediction)
+    store.append_prediction("owner/repo", "ci", None, "deadbee" + "2" * 33, prediction)
+
+    assert store.find_pending_by_commit("owner/repo", "deadbee", "ci") is None
+
+
+def test_history_store_prefers_exact_sha_over_prefix_collision(tmp_path):
+    store = PredictionHistoryStore(tmp_path / "history.csv")
+    prediction = FailurePrediction(
+        model_available=True,
+        failure_probability=0.4,
+        predicted_failure=False,
+        risk_level="LOW",
+        model_version="test",
+    )
+    exact_sha = "deadbee" + "1" * 33
+    expected = store.append_prediction("owner/repo", "ci", None, exact_sha, prediction)
+    store.append_prediction("owner/repo", "ci", None, "deadbee" + "2" * 33, prediction)
+
+    pending = store.find_pending_by_commit("owner/repo", exact_sha, "ci")
+
+    assert pending is not None
+    assert pending["prediction_id"] == expected
+
+
 def test_temporal_ordering_uses_run_id_tiebreaker():
     frame = pd.DataFrame(
         {
@@ -221,11 +271,11 @@ def test_temporal_ordering_uses_run_id_tiebreaker():
     assert list(ordered["run_id"]) == [1, 3, 2]
 
 
-def test_missing_github_token_raises_for_collector():
-    import pytest
+def test_missing_github_token_uses_anonymous_public_client():
+    collector = HistoricalRunCollector(token="")
 
-    with pytest.raises(ValueError, match="GITHUB_ACCESS_TOKEN"):
-        HistoricalRunCollector(token="")
+    assert collector.token is None
+    assert collector.github is not None
 
 
 def test_train_cli_refuses_insufficient_data(tmp_path):

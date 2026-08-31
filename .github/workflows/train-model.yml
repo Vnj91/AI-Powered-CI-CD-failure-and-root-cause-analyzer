@@ -8,27 +8,38 @@ on:
         required: false
         type: string
   schedule:
-    # Weekly retrain — avoids burning minutes on every PR
+    # Weekly backstop in addition to completed main-branch CI runs.
     - cron: "0 6 * * 1"
+  workflow_run:
+    workflows:
+      - CI/CD Pipeline
+      - Controlled CI Failure Generator (Dev/Testing Only)
+    types:
+      - completed
+    branches:
+      - main
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: train-model-${{ github.ref }}
+  group: train-model-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
   train:
     name: Collect, Train, Evaluate, Publish Model
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -41,40 +52,65 @@ jobs:
 
       - name: Collect historical workflow runs
         env:
-          GITHUB_ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACCESS_TOKEN: ${{ github.token }}
+          REQUESTED_REPOSITORY: ${{ github.event.inputs.repository }}
         run: |
           set -euo pipefail
-          REPO="${{ github.event.inputs.repository }}"
-          if [ -z "$REPO" ]; then
+          REPO="${REQUESTED_REPOSITORY}"
+          if [ -z "${REPO}" ]; then
             REPO="${{ github.repository }}"
           fi
-          mkdir -p data models
-          python3 -m src.prediction.cli collect "$REPO" --output data/historical_runs.csv
+          if [[ ! "${REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Invalid repository input; expected owner/repo."
+            exit 2
+          fi
+          mkdir -p data models reports
+          python -m src.prediction.cli collect "${REPO}" \
+            --output data/historical_runs.csv \
+            --limit 500 | tee reports/collection.txt
 
       - name: Inspect dataset
-        run: python3 -m src.prediction.cli inspect --dataset data/historical_runs.csv
-
-      - name: Train model (skip if insufficient real data)
-        id: train
         run: |
-          set +e
-          python3 -m src.prediction.cli train \
+          python -m src.prediction.cli inspect \
+            --dataset data/historical_runs.csv | tee reports/dataset-validation.json
+
+      - name: Apply real-data quality gate
+        id: quality
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from src.prediction.dataset_validator import validate_dataset
+
+          report = validate_dataset("data/historical_runs.csv")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as handle:
+              handle.write(
+                  f"sufficient_for_training={str(report.sufficient_for_training).lower()}\n"
+              )
+              handle.write(f"total_runs={report.total_runs}\n")
+              handle.write(f"failure_runs={report.failure_runs}\n")
+              handle.write(f"success_runs={report.success_runs}\n")
+          PY
+
+      - name: Train model from real workflow outcomes
+        if: steps.quality.outputs.sufficient_for_training == 'true'
+        run: |
+          set -euo pipefail
+          python -m src.prediction.cli train \
             --dataset data/historical_runs.csv \
-            --model models/failure_predictor.joblib
-          code=$?
-          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
-          exit 0
+            --model models/failure_predictor.joblib | tee reports/training.txt
 
       - name: Evaluate model
-        if: steps.train.outputs.exit_code == '0' && hashFiles('models/failure_predictor.joblib') != ''
+        if: steps.quality.outputs.sufficient_for_training == 'true' && hashFiles('models/failure_predictor.joblib') != ''
         run: |
-          python3 -m src.prediction.cli evaluate \
+          python -m src.prediction.cli evaluate \
             --dataset data/historical_runs.csv \
-            --model models/failure_predictor.joblib
+            --model models/failure_predictor.joblib | tee reports/evaluation.txt
 
       - name: Upload trained model artifact
         if: hashFiles('models/failure_predictor.joblib') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: failure-predictor-model
           path: |
@@ -85,8 +121,32 @@ jobs:
           if-no-files-found: warn
           retention-days: 90
 
+      - name: Upload auditable training dataset and reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: failure-predictor-training-data
+          path: |
+            data/historical_runs.csv
+            reports/
+          if-no-files-found: warn
+          retention-days: 90
+
       - name: Report training skipped
-        if: hashFiles('models/failure_predictor.joblib') == ''
+        if: steps.quality.outputs.sufficient_for_training != 'true'
         run: |
           echo "No model artifact produced — insufficient real historical data or training refused."
           echo "Collect more CI history on this repository and re-run this workflow."
+
+      - name: Publish training summary
+        if: always()
+        run: |
+          {
+            echo "### Failure predictor training"
+            echo
+            echo "- Real runs: **${{ steps.quality.outputs.total_runs || 'unavailable' }}**"
+            echo "- Successful runs: **${{ steps.quality.outputs.success_runs || 'unavailable' }}**"
+            echo "- Failed runs: **${{ steps.quality.outputs.failure_runs || 'unavailable' }}**"
+            echo "- Training quality gate: **${{ steps.quality.outputs.sufficient_for_training || 'not evaluated' }}**"
+            echo "- Model artifact: **${{ hashFiles('models/failure_predictor.joblib') != '' }}**"
+          } >> "${GITHUB_STEP_SUMMARY}"
