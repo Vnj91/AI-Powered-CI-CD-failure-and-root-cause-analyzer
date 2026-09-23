@@ -151,3 +151,36 @@ Process completed with exit code 17.
 
 def test_timeout_errors_have_timeout_category():
     assert classify_error("TimeoutError", "Operation timed out") == ErrorCategory.TIMEOUT
+
+
+def test_parser_detects_pip_resolution_failure_instead_of_noise():
+    result = parse_log_content(
+        """##[group]Run python -m pip install -r requirements.txt
+Looking in indexes: https://pypi.org/simple
+ERROR: Ignored the following yanked versions: 1.0.0
+ERROR: Could not find a version that satisfies the requirement missing-pkg==9.9.9
+ERROR: No matching distribution found for missing-pkg==9.9.9
+##[error]Process completed with exit code 1.
+"""
+    )
+
+    assert result.primary_error is not None
+    assert result.primary_error.error_type == "PipError"
+    assert result.primary_error.error_category == ErrorCategory.DEPENDENCY
+    assert "Could not find a version" in result.primary_error.error_message
+    assert "yanked versions" not in result.primary_error.error_message.lower()
+    assert result.primary_error.failed_step == "python -m pip install -r requirements.txt"
+
+
+def test_parser_ignores_pip_notices_when_only_exit_code_remains():
+    result = parse_log_content(
+        """##[group]Run python -m pip install -r requirements.txt
+ERROR: Ignored the following yanked versions: 1.0.0
+A new release of pip is available
+Process completed with exit code 1.
+"""
+    )
+
+    assert result.primary_error is not None
+    assert result.primary_error.error_type == "ProcessExitError"
+    assert result.primary_error.error_category == ErrorCategory.UNKNOWN

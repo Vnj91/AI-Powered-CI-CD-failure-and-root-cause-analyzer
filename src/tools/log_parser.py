@@ -213,6 +213,14 @@ class LogPatterns:
         r'^(?:Error|ERROR|error):\s*(.+)$',
         re.MULTILINE
     )
+
+    # pip / packaging failures that are not Python exceptions
+    PIP_ERROR = re.compile(
+        r'^(?:ERROR|error):\s*(?P<message>(?:Could not find a version|No matching distribution|'
+        r'ResolutionImpossible|Cannot uninstall|Failed to build|Failed building wheel|'
+        r'Could not install packages|pip\'s dependency resolver).+)$',
+        re.MULTILINE | re.IGNORECASE,
+    )
     
     # Test failure patterns (pytest, jest, etc.)
     PYTEST_FAILED = re.compile(
@@ -262,6 +270,26 @@ def remove_ansi_sequences(log_content: str) -> str:
     return LogPatterns.ANSI_ESCAPE.sub('', log_content)
 
 
+_NOISE_ERROR_HINTS = (
+    "ignored the following yanked versions",
+    "looking in indexes:",
+    "requirement already satisfied",
+    "a new release of pip is available",
+    "to update, run: python",
+    "deprecated",
+    "notice:",
+)
+
+
+def is_non_actionable_diagnostic(message: str) -> bool:
+    """Return whether a log line looks like a warning, not a failing command."""
+
+    lowered = (message or "").strip().lower()
+    if not lowered:
+        return True
+    return any(hint in lowered for hint in _NOISE_ERROR_HINTS)
+
+
 def classify_error(error_type: str, error_message: str) -> ErrorCategory:
     """
     Classify an error into a high-level category.
@@ -280,13 +308,26 @@ def classify_error(error_type: str, error_message: str) -> ErrorCategory:
     message_lower = error_message.lower()
     
     # Dependency errors
-    if any(x in error_type_lower for x in ['modulenotfound', 'import', 'module']):
+    if any(x in error_type_lower for x in ['modulenotfound', 'import', 'module', 'pip', 'packaging']):
         return ErrorCategory.DEPENDENCY
     if 'cannot find module' in message_lower:
         return ErrorCategory.DEPENDENCY
     if 'no module named' in message_lower:
         return ErrorCategory.DEPENDENCY
     if 'npm err' in message_lower:
+        return ErrorCategory.DEPENDENCY
+    if any(
+        hint in message_lower
+        for hint in (
+            "could not find a version",
+            "no matching distribution",
+            "resolutionimpossible",
+            "failed to build",
+            "failed building wheel",
+            "could not install packages",
+            "dependency resolver",
+        )
+    ):
         return ErrorCategory.DEPENDENCY
     
     # Syntax errors
@@ -467,7 +508,10 @@ class LogParser:
         
         # STEP 3: Find npm/Node.js errors (if no Python errors found)
         if not errors:
-            npm_errors = LogPatterns.NPM_ERROR.findall(cleaned_content)
+            npm_errors = [
+                message for message in LogPatterns.NPM_ERROR.findall(cleaned_content)
+                if not is_non_actionable_diagnostic(message)
+            ]
             node_module_errors = LogPatterns.NODE_MODULE_ERROR.findall(cleaned_content)
             
             for module_name in node_module_errors:
@@ -486,6 +530,19 @@ class LogParser:
                     error_category=ErrorCategory.DEPENDENCY,
                     exit_code=exit_code,
                     relevant_lines=npm_errors[:10]  # Keep first 10 npm error lines
+                ))
+
+        if not errors:
+            pip_match = LogPatterns.PIP_ERROR.search(cleaned_content)
+            if pip_match:
+                error_message = pip_match.group("message").strip()
+                errors.append(ParsedError(
+                    error_type="PipError",
+                    error_message=error_message,
+                    error_category=classify_error("PipError", error_message),
+                    failed_step=self._find_failed_step(cleaned_content, pip_match.start()),
+                    exit_code=exit_code,
+                    raw_error_block=self._extract_error_block(cleaned_content, pip_match.start()),
                 ))
 
         # STEP 4: Find pytest summary failures and bare AssertionError output.
@@ -523,13 +580,17 @@ class LogParser:
         
         # STEP 5: Find generic errors (if nothing else found)
         if not errors:
-            generic_errors = LogPatterns.GENERIC_ERROR.findall(cleaned_content)
+            generic_errors = [
+                error_msg.strip()
+                for error_msg in LogPatterns.GENERIC_ERROR.findall(cleaned_content)
+                if error_msg.strip() and not is_non_actionable_diagnostic(error_msg)
+            ]
             
             for error_msg in generic_errors[:3]:  # Limit to first 3
                 errors.append(ParsedError(
                     error_type="Error",
-                    error_message=error_msg.strip(),
-                    error_category=ErrorCategory.UNKNOWN,
+                    error_message=error_msg,
+                    error_category=classify_error("Error", error_msg),
                     exit_code=exit_code
                 ))
         
@@ -539,11 +600,13 @@ class LogParser:
                 # Skip generic "Process completed with exit code" errors
                 if 'Process completed with exit code' in gh_error:
                     continue
+                if is_non_actionable_diagnostic(gh_error):
+                    continue
                     
                 errors.append(ParsedError(
                     error_type="GitHubActionsError",
                     error_message=gh_error.strip(),
-                    error_category=ErrorCategory.UNKNOWN,
+                    error_category=classify_error("GitHubActionsError", gh_error),
                     exit_code=exit_code
                 ))
 

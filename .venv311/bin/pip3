@@ -1,0 +1,8 @@
+#!/bin/sh
+'''exec' "/Users/utkarshkhandelwal/Documents/ChatGPT/cd project/AI-Powered-CI-CD-failure-and-root-cause-analyzer-local/.venv311/bin/python3.11" "$0" "$@"
+' '''
+import sys
+from pip._internal.cli.main import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main())
