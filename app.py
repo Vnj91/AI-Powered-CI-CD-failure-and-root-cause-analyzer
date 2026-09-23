@@ -862,12 +862,20 @@ def render_local_analysis(repository: str) -> None:
 
 
 def render_live_analysis(repository: str) -> None:
-    st.markdown("#### AI-enriched GitHub failed-run analysis")
     provider = get_llm_provider_status()
-    st.caption(
-        f"Fetches bounded, redacted Actions logs and uses {provider.display_name}. "
-        "Tavily web research is optional."
-    )
+    # Choose header based on whether an LLM is actually available
+    if provider.active == "none":
+        st.markdown("#### Deterministic GitHub failed-run analysis (no LLM)")
+        st.caption(
+            "Fetches bounded, redacted Actions logs and runs deterministic local triage. "
+            "Optional Tavily web research may supplement the analysis if configured."
+        )
+    else:
+        st.markdown("#### AI-enriched GitHub failed-run analysis")
+        st.caption(
+            f"Fetches bounded, redacted Actions logs and uses {provider.display_name}. "
+            "Tavily web research is optional."
+        )
     missing = []
     runtime_token = _github_runtime_token()
     if not runtime_token:
@@ -875,11 +883,15 @@ def render_live_analysis(repository: str) -> None:
     if not provider.ready:
         missing.append(provider.detail)
     if missing:
-        st.warning("AI enrichment needs " + "; ".join(missing) + " Offline triage remains available.")
+        # If only LLM is missing but deterministic path is available, show a milder message
+        if provider.active == "none":
+            st.info("LLM unavailable; deterministic RCA remains available.")
+        else:
+            st.warning("AI enrichment needs " + "; ".join(missing) + " Offline triage remains available.")
     if Config.TAVILY_API_KEY:
-        st.info("Tavily research is enabled for this analysis.")
+        st.info("Tavily web research is enabled and may provide optional evidence.")
     else:
-        st.info("Tavily is not configured; analysis will continue with logs, code context, and the selected LLM.")
+        st.info("Tavily is not configured; analysis will continue with logs and code context.")
     repository_problem = _repository_error(repository)
     if repository_problem:
         st.info(repository_problem)
@@ -896,7 +908,8 @@ def render_live_analysis(repository: str) -> None:
 
                     workflow_choice = st.session_state.get("automation_workflow", "CI/CD Pipeline")
                     workflow_name = None if workflow_choice == "All workflows" else workflow_choice
-                    automation = GitHubAutomationService(token=runtime_token, repository=repository)
+                    # Ensure the automation instance uses the current token
+                    automation = GitHubAutomationService(token=_github_runtime_token(), repository=repository)
                     context = automation.latest_failed_run_context(
                         repository=repository,
                         workflow_name=workflow_name,
@@ -950,6 +963,17 @@ def _refresh_repository_snapshot(automation: Any, repository: str) -> Any:
         workflows=workflows,
         workflow_error=workflow_error,
     )
+    # Attempt to fetch prediction history when authenticated and repository connected
+    runtime_token = _github_runtime_token()
+    if runtime_token and status.get("connected") and status.get("authenticated"):
+        try:
+            _attempt_download_model_from_actions(repository, runtime_token)
+        except Exception:
+            pass
+        try:
+            _attempt_download_prediction_history(repository, runtime_token)
+        except Exception:
+            pass
     return status
 
 
@@ -971,11 +995,111 @@ def _attempt_download_model_from_actions(repository: str, runtime_token: str) ->
         return False
 
 
+def _attempt_download_prediction_history(repository: str, runtime_token: str) -> bool:
+    """Download and merge the latest finalized prediction-history artifact into local CSV.
+
+    Returns True if a prediction_history CSV was downloaded and merged.
+    """
+    try:
+        from src.integrations.github_automation import GitHubAutomationService
+        from src.prediction.history_store import load_prediction_history, save_prediction_history
+        import pandas as pd
+
+        automation = GitHubAutomationService(token=runtime_token, repository=repository)
+        temp_path = Config.DATA_DIR / "prediction_history_download.csv"
+        success = automation.download_latest_prediction_history(repository=repository, dest_path=temp_path)
+        if not success or not temp_path.exists():
+            return False
+
+        # Load existing and downloaded, merge by prediction_id with downloaded winning
+        try:
+            existing = load_prediction_history(Config.PREDICTION_HISTORY_PATH)
+        except Exception:
+            existing = None
+        try:
+            downloaded = load_prediction_history(temp_path)
+        except Exception:
+            return False
+
+        # Merge: index by prediction_id, downloaded wins
+        if existing is None or existing.empty:
+            merged = downloaded
+        else:
+            combined = existing.set_index('prediction_id')
+            combined.update(downloaded.set_index('prediction_id'))
+            # Include any new rows from downloaded that didn't exist in existing
+            new_ids = set(downloaded['prediction_id']) - set(existing['prediction_id'])
+            if new_ids:
+                combined = pd.concat([combined, downloaded.set_index('prediction_id').loc[list(new_ids)]])
+            merged = combined.reset_index()
+
+        # Persist merged history
+        save_prediction_history(merged, Config.PREDICTION_HISTORY_PATH)
+        # cleanup temp
+        try:
+            temp_path.unlink()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
 def _render_repository_activity(snapshot: dict[str, Any]) -> None:
     commits = snapshot.get("commits", [])
     runs = snapshot.get("runs", [])
     if not commits and not runs:
         return
+
+
+    def _attempt_download_prediction_history(repository: str, runtime_token: str) -> bool:
+        """Download and merge the latest finalized prediction-history artifact into local CSV.
+
+        Returns True if a prediction_history CSV was downloaded and merged.
+        """
+        try:
+            from src.integrations.github_automation import GitHubAutomationService
+            from src.prediction.history_store import load_prediction_history, save_prediction_history
+            import pandas as pd
+
+            automation = GitHubAutomationService(token=runtime_token, repository=repository)
+            temp_path = Config.DATA_DIR / "prediction_history_download.csv"
+            success = automation.download_latest_prediction_history(repository=repository, dest_path=temp_path)
+            if not success or not temp_path.exists():
+                return False
+
+            # Load existing and downloaded, merge by prediction_id with downloaded winning
+            try:
+                existing = load_prediction_history(Config.PREDICTION_HISTORY_PATH)
+            except Exception:
+                existing = None
+            try:
+                downloaded = load_prediction_history(temp_path)
+            except Exception:
+                return False
+
+            # Merge: index by prediction_id, downloaded wins
+            if existing is None or existing.empty:
+                merged = downloaded
+            else:
+                combined = existing.set_index('prediction_id')
+                combined.update(downloaded.set_index('prediction_id'))
+                # Include any new rows from downloaded that didn't exist in existing
+                new_ids = set(downloaded['prediction_id']) - set(existing['prediction_id'])
+                if new_ids:
+                    combined = pd.concat([combined, downloaded.set_index('prediction_id').loc[list(new_ids)]])
+                merged = combined.reset_index()
+
+            # Persist merged history
+            save_prediction_history(merged, Config.PREDICTION_HISTORY_PATH)
+            # cleanup temp
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
     st.markdown("#### Live repository activity")
     left, right = st.columns(2)
     with left:
@@ -1131,12 +1255,21 @@ def render_automation(repository: str, prediction_service: FailurePredictionServ
         if problem:
             st.error(problem)
         runtime_token = _github_runtime_token()
+        # Create a per-render automation instance so the Predict/Analyze
+        # handlers call the (possibly patched) service. Connect handler
+        # still recreates an automation at click time to pick up token
+        # changes made during the session.
         automation = GitHubAutomationService(
             token=runtime_token,
             repository=repository if repository and not problem else None,
         )
         controls = st.columns([1.3, 1, 4])
-        connect_label = "Refresh GitHub activity" if connected else "Connect repository"
+        persisted_status = st.session_state.get("github_snapshot", {}).get("status", {})
+        connect_label = (
+            "Refresh GitHub activity"
+            if persisted_status.get("authenticated") or persisted_status.get("connected") or bool(runtime_token)
+            else "Connect repository"
+        )
         if controls[0].button(
             connect_label,
             type="primary",
@@ -1145,18 +1278,19 @@ def render_automation(repository: str, prediction_service: FailurePredictionServ
         ) and _cooldown_allows("github_connect"):
             with st.spinner("Verifying GitHub access and loading repository activity…"):
                 try:
+                    automation = GitHubAutomationService(
+                        token=_github_runtime_token(),
+                        repository=repository if repository and not problem else None,
+                    )
                     status = _refresh_repository_snapshot(automation, repository)
-                    # If the local model is missing and we have a runtime token, attempt to download the latest trusted artifact
                     runtime_token = _github_runtime_token()
                     if not Config.PREDICTOR_MODEL_PATH.exists() and runtime_token:
                         try:
                             downloaded = _attempt_download_model_from_actions(repository, runtime_token)
                             if downloaded:
                                 st.session_state["artifact_notice"] = "Downloaded latest trusted model artifact from GitHub Actions."
-                                # Invalidate cached prediction service so it will reload the model
                                 get_prediction_service.clear()
                         except Exception:
-                            # Preserve existing behavior: do not fail the refresh if download fails
                             pass
                     st.session_state["artifact_notice"] = f"GitHub repository {repository} is connected."
                     st.rerun()
@@ -1171,8 +1305,9 @@ def render_automation(repository: str, prediction_service: FailurePredictionServ
 
     snapshot = _github_snapshot(repository)
     status = snapshot.get("status", {})
-    connected = bool(status.get("connected"))
-    authenticated = bool(status.get("authenticated"))
+    persisted_status = st.session_state.get("github_snapshot", {}).get("status", {})
+    connected = bool(status.get("connected") or persisted_status.get("connected"))
+    authenticated = bool(status.get("authenticated") or persisted_status.get("authenticated"))
 
     discovered_workflow_names = {
         str(workflow.get("name"))

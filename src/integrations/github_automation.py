@@ -1142,6 +1142,89 @@ class GitHubAutomationService:
 
         return False
 
+    def download_latest_prediction_history(
+        self,
+        repository: Optional[str],
+        dest_path: str | Path,
+        artifact_name: str = "prediction-history",
+        expected_member: str = "data/prediction_history.csv",
+        max_runs: int = 40,
+    ) -> bool:
+        """Download the latest finalized prediction-history artifact and extract the CSV member.
+
+        Returns True when the expected_member was successfully written to dest_path.
+        Uses the same authenticated artifact download approach as download_latest_model_artifact.
+        """
+        if not self.__token:
+            raise GitHubAutomationError("Authenticated GitHub token required to download artifacts.")
+
+        name = self._repository_name(repository)
+        dest = Path(dest_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        session = requests.Session()
+        session.headers.update(
+            {
+                "Authorization": f"token {self.__token}",
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "CI-CD-Root-Cause-Analyzer",
+            }
+        )
+
+        # Search recent workflow runs for the Prediction Feedback workflow
+        # It may have different names; allow broad search by runs list and artifact name
+        api = f"https://api.github.com/repos/{name}/actions/runs?status=success&per_page={int(max_runs)}"
+        try:
+            resp = session.get(api, timeout=30)
+            resp.raise_for_status()
+            runs = resp.json().get("workflow_runs", [])
+        except Exception as exc:
+            logger = logging.getLogger("github_automation")
+            logger.debug("LIST_RUNS_FAILED_FOR_PREDICTION_HISTORY: repo=%s url=%s error=%s", name, api, _safe_error(exc))
+            raise GitHubAutomationError(f"Could not list workflow runs: {_safe_error(exc)}") from exc
+
+        for run in runs:
+            run_id = int(run.get("id") or 0)
+            if not run_id:
+                continue
+            artifacts_api = f"https://api.github.com/repos/{name}/actions/runs/{run_id}/artifacts"
+            try:
+                aresp = session.get(artifacts_api, timeout=30)
+                aresp.raise_for_status()
+                artifacts = aresp.json().get("artifacts", [])
+            except Exception:
+                continue
+
+            for art in artifacts:
+                if str(art.get("name") or "") != artifact_name:
+                    continue
+                archive_url = art.get("archive_download_url")
+                if not archive_url:
+                    continue
+                try:
+                    down = session.get(archive_url, stream=True, timeout=120)
+                    status_code = getattr(down, "status_code", None)
+                    if status_code is None or int(status_code) != 200:
+                        continue
+                except Exception:
+                    continue
+
+                try:
+                    with zipfile.ZipFile(io.BytesIO(down.content)) as archive:
+                        for info in archive.infolist():
+                            # match path endswith expected_member
+                            if str(info.filename).endswith(expected_member):
+                                # write to dest path (overwrite into a temp file)
+                                with archive.open(info) as source:
+                                    data = source.read()
+                                dest.write_bytes(data)
+                                return True
+                except zipfile.BadZipFile:
+                    # Artifact not a zip with member
+                    continue
+
+        return False
+
 
 __all__ = [
     "GitHubAuthenticationRequired",

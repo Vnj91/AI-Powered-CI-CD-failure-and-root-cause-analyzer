@@ -325,3 +325,14 @@ class PredictionHistoryStore:
             scored["predicted_failure"].astype(bool) == scored["actual_failure"].astype(int).astype(bool)
         )
         return scored.tail(limit)
+
+
+# Convenience helpers used by the dashboard for loading/saving whole history
+def load_prediction_history(path: str | Path) -> "pd.DataFrame":
+    store = PredictionHistoryStore(path)
+    return store._load()
+
+
+def save_prediction_history(frame: "pd.DataFrame", path: str | Path) -> None:
+    store = PredictionHistoryStore(path)
+    store._save(frame)
