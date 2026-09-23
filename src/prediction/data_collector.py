@@ -34,6 +34,7 @@ SYSTEM_WORKFLOW_NAMES = {
     "pre-ci failure prediction",
     "prediction feedback",
     "train failure predictor",
+    "controlled ci failure generator (dev/testing only)",
 }
 
 
@@ -52,7 +53,13 @@ class HistoricalRunCollector:
     """Collect workflow runs and flatten them into a trainable dataset."""
 
     def __init__(self, token: Optional[str] = None, recent_window: int = 10):
-        self.token = token or GITHUB_ACCESS_TOKEN
+        # If a token argument was explicitly passed (even an empty string), respect it.
+        # An explicit empty string means 'no token' (anonymous client) for tests
+        # and for deployments that want credential-free reads.
+        if token is not None:
+            self.token = token or None
+        else:
+            self.token = GITHUB_ACCESS_TOKEN or None
         self.recent_window = recent_window
         self.github = Github(auth=Auth.Token(self.token)) if self.token else Github()
         self._file_feature_cache: dict[str, dict[str, object]] = {}

@@ -918,6 +918,24 @@ def _refresh_repository_snapshot(automation: Any, repository: str) -> Any:
     return status
 
 
+def _attempt_download_model_from_actions(repository: str, runtime_token: str) -> bool:
+    """Try to download the latest trusted model artifact produced by the training workflow.
+
+    Returns True when at least one expected model file was written to Config.MODELS_DIR.
+    """
+    try:
+        from src.integrations.github_automation import GitHubAutomationService
+
+        automation = GitHubAutomationService(token=runtime_token, repository=repository)
+        return automation.download_latest_model_artifact(
+            repository=repository,
+            artifact_name=Config.MODEL_ARTIFACT_NAME,
+            dest_dir=Config.MODELS_DIR,
+        )
+    except Exception:
+        return False
+
+
 def _render_repository_activity(snapshot: dict[str, Any]) -> None:
     commits = snapshot.get("commits", [])
     runs = snapshot.get("runs", [])
@@ -1092,7 +1110,19 @@ def render_automation(repository: str, prediction_service: FailurePredictionServ
         ) and _cooldown_allows("github_connect"):
             with st.spinner("Verifying GitHub access and loading repository activity…"):
                 try:
-                    _refresh_repository_snapshot(automation, repository)
+                    status = _refresh_repository_snapshot(automation, repository)
+                    # If the local model is missing and we have a runtime token, attempt to download the latest trusted artifact
+                    runtime_token = _github_runtime_token()
+                    if not Config.PREDICTOR_MODEL_PATH.exists() and runtime_token:
+                        try:
+                            downloaded = _attempt_download_model_from_actions(repository, runtime_token)
+                            if downloaded:
+                                st.session_state["artifact_notice"] = "Downloaded latest trusted model artifact from GitHub Actions."
+                                # Invalidate cached prediction service so it will reload the model
+                                get_prediction_service.clear()
+                        except Exception:
+                            # Preserve existing behavior: do not fail the refresh if download fails
+                            pass
                     st.session_state["artifact_notice"] = f"GitHub repository {repository} is connected."
                     st.rerun()
                 except Exception as exc:

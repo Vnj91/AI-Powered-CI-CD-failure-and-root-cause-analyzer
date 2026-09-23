@@ -952,6 +952,95 @@ class GitHubAutomationService:
             ),
         )
 
+    def download_latest_model_artifact(
+        self,
+        repository: Optional[str],
+        artifact_name: str,
+        dest_dir: str | Path,
+        expected_files: Optional[list[str]] = None,
+        max_runs: int = 20,
+    ) -> bool:
+        """Attempt to download the latest successful training workflow's named artifact.
+
+        Returns True when at least one expected file was extracted into dest_dir.
+        This uses the Actions REST API and requires an authenticated token.
+        """
+
+        if not self.__token:
+            raise GitHubAutomationError("Authenticated GitHub token required to download artifacts.")
+
+        name = self._repository_name(repository)
+        dest = Path(dest_dir)
+        dest.mkdir(parents=True, exist_ok=True)
+
+        if expected_files is None:
+            expected_files = [
+                "failure_predictor.joblib",
+                "failure_predictor_metadata.json",
+                "failure_category_predictor.joblib",
+                "failure_category_predictor_metadata.json",
+            ]
+
+        session = requests.Session()
+        session.headers.update({"Authorization": f"Bearer {self.__token}"})
+
+        api = f"https://api.github.com/repos/{name}/actions/workflows/train-model.yml/runs?status=success&per_page={int(max_runs)}"
+        try:
+            resp = session.get(api, timeout=30)
+            resp.raise_for_status()
+            runs = resp.json().get("workflow_runs", [])
+        except Exception as exc:
+            raise GitHubAutomationError(f"Could not list training workflow runs: {_safe_error(exc)}") from exc
+
+        for run in runs:
+            run_id = int(run.get("id") or 0)
+            if not run_id:
+                continue
+            artifacts_api = f"https://api.github.com/repos/{name}/actions/runs/{run_id}/artifacts"
+            try:
+                aresp = session.get(artifacts_api, timeout=30)
+                aresp.raise_for_status()
+                artifacts = aresp.json().get("artifacts", [])
+            except Exception:
+                continue
+
+            for art in artifacts:
+                if str(art.get("name") or "") != artifact_name:
+                    continue
+                archive_url = art.get("archive_download_url")
+                if not archive_url:
+                    continue
+                try:
+                    down = session.get(archive_url, stream=True, timeout=120)
+                    down.raise_for_status()
+                except Exception as exc:
+                    raise GitHubAutomationError(f"Failed to download artifact archive: {_safe_error(exc)}") from exc
+
+                # Extract only expected files to the destination directory.
+                extracted_any = False
+                try:
+                    with zipfile.ZipFile(io.BytesIO(down.content)) as archive:
+                        for info in archive.infolist():
+                            member_name = info.filename
+                            base = Path(member_name).name
+                            if base in expected_files:
+                                target = dest / base
+                                with archive.open(info) as source, open(target, "wb") as out:
+                                    out.write(source.read())
+                                extracted_any = True
+                except zipfile.BadZipFile:
+                    # Some artifact uploads may be single files; try saving raw content
+                    for fname in expected_files:
+                        if fname in (art.get("name") or ""):
+                            target = dest / fname
+                            target.write_bytes(down.content)
+                            extracted_any = True
+
+                if extracted_any:
+                    return True
+
+        return False
+
 
 __all__ = [
     "GitHubAuthenticationRequired",

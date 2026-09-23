@@ -15,7 +15,8 @@ def _run(name: str, conclusion: str):
 
 def test_collector_excludes_product_automation_workflows_by_default():
     assert HistoricalRunCollector._is_trainable_run(_run("CI/CD Pipeline", "success"))
-    assert HistoricalRunCollector._is_trainable_run(
+    # Controlled CI Failure Generator runs are development-only and should be excluded by default
+    assert not HistoricalRunCollector._is_trainable_run(
         _run("Controlled CI Failure Generator (Dev/Testing Only)", "failure")
     )
     assert not HistoricalRunCollector._is_trainable_run(
