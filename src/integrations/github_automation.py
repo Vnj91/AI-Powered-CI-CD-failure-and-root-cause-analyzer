@@ -16,6 +16,8 @@ from collections.abc import Callable, Iterable
 from datetime import datetime
 from itertools import islice
 from typing import Any, Optional, TYPE_CHECKING
+from pathlib import Path
+import logging
 
 import requests
 from github import Auth, Github, GithubException
@@ -684,14 +686,35 @@ class GitHubAutomationService:
         total_uncompressed = 0
         try:
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+                truncated = False
                 for info in sorted(archive.infolist(), key=lambda item: item.filename):
                     if info.is_dir():
                         continue
-                    total_uncompressed += int(info.file_size)
-                    if total_uncompressed > max_bytes:
-                        raise GitHubAutomationError(
-                            f"Expanded workflow logs exceed the {max_bytes:,}-byte safety limit."
+                    file_size = int(info.file_size)
+                    if total_uncompressed + file_size > max_bytes:
+                        # Gracefully truncate this file's content to fit remaining budget
+                        remaining = max_bytes - total_uncompressed
+                        if remaining <= 0:
+                            truncated = True
+                            break
+                        try:
+                            with archive.open(info) as fh:
+                                part = fh.read(remaining)
+                        except Exception:
+                            part = b""
+                        content = part.decode("utf-8", errors="replace")
+                        redacted = redact_sensitive_text(content)
+                        log_files.append(
+                            GitHubWorkflowLogFile(
+                                name=f"{info.filename}.part",
+                                content=redacted,
+                                size_bytes=len(redacted.encode("utf-8")),
+                            )
                         )
+                        total_uncompressed += len(part)
+                        truncated = True
+                        break
+                    total_uncompressed += file_size
                     content = archive.read(info).decode("utf-8", errors="replace")
                     redacted = redact_sensitive_text(content)
                     log_files.append(
@@ -701,19 +724,31 @@ class GitHubAutomationService:
                             size_bytes=len(redacted.encode("utf-8")),
                         )
                     )
+                if truncated:
+                    # Add a small notice file indicating truncation occurred
+                    notice = (
+                        "Workflow logs were truncated because the expanded archive exceeded the safety limit. "
+                        f"Showing the first {max_bytes:,} bytes of uncompressed log data."
+                    )
+                    log_files.append(
+                        GitHubWorkflowLogFile(name="TRUNCATED_NOTICE", content=notice, size_bytes=len(notice.encode("utf-8")))
+                    )
         except zipfile.BadZipFile:
             content = redact_sensitive_text(payload.decode("utf-8", errors="replace"))
             if len(content.encode("utf-8")) > max_bytes:
-                raise GitHubAutomationError(
-                    f"Workflow logs exceed the {max_bytes:,}-byte safety limit."
+                # Truncate raw text payload instead of raising
+                truncated_content = content.encode("utf-8")[:max_bytes].decode("utf-8", errors="replace")
+                notice = (
+                    "Workflow logs were truncated because the expanded archive exceeded the safety limit. "
+                    f"Showing the first {max_bytes:,} bytes of uncompressed log data."
                 )
-            log_files.append(
-                GitHubWorkflowLogFile(
-                    name="workflow.log",
-                    content=content,
-                    size_bytes=len(content.encode("utf-8")),
+                log_files.append(
+                    GitHubWorkflowLogFile(name="workflow.log", content=truncated_content, size_bytes=len(truncated_content.encode("utf-8")))
                 )
-            )
+                log_files.append(
+                    GitHubWorkflowLogFile(name="TRUNCATED_NOTICE", content=notice, size_bytes=len(notice.encode("utf-8")))
+                )
+            
         return log_files
 
     def get_workflow_logs(
@@ -982,7 +1017,15 @@ class GitHubAutomationService:
             ]
 
         session = requests.Session()
-        session.headers.update({"Authorization": f"Bearer {self.__token}"})
+        # Use the legacy 'token' scheme which GitHub expects in many API flows,
+        # and include a sensible Accept/User-Agent to avoid API surprises.
+        session.headers.update(
+            {
+                "Authorization": f"token {self.__token}",
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "CI-CD-Root-Cause-Analyzer",
+            }
+        )
 
         api = f"https://api.github.com/repos/{name}/actions/workflows/train-model.yml/runs?status=success&per_page={int(max_runs)}"
         try:
@@ -990,6 +1033,8 @@ class GitHubAutomationService:
             resp.raise_for_status()
             runs = resp.json().get("workflow_runs", [])
         except Exception as exc:
+            logger = logging.getLogger("github_automation")
+            logger.debug("LIST_RUNS_FAILED: repo=%s url=%s error=%s", name, api, _safe_error(exc))
             raise GitHubAutomationError(f"Could not list training workflow runs: {_safe_error(exc)}") from exc
 
         for run in runs:
@@ -1002,6 +1047,8 @@ class GitHubAutomationService:
                 aresp.raise_for_status()
                 artifacts = aresp.json().get("artifacts", [])
             except Exception:
+                logger = logging.getLogger("github_automation")
+                logger.debug("ARTIFACTS_LIST_FAILED: run_id=%s url=%s", run_id, artifacts_api)
                 continue
 
             for art in artifacts:
@@ -1012,7 +1059,16 @@ class GitHubAutomationService:
                     continue
                 try:
                     down = session.get(archive_url, stream=True, timeout=120)
-                    down.raise_for_status()
+                    status_code = getattr(down, "status_code", None)
+                    if status_code is None or int(status_code) != 200:
+                        logger = logging.getLogger("github_automation")
+                        logger.debug(
+                            "ARTIFACT_DOWNLOAD_FAILED: run_id=%s archive_url=%s status=%s",
+                            run_id,
+                            archive_url,
+                            status_code,
+                        )
+                        raise GitHubAutomationError(f"Failed to download artifact archive: HTTP {status_code}")
                 except Exception as exc:
                     raise GitHubAutomationError(f"Failed to download artifact archive: {_safe_error(exc)}") from exc
 
@@ -1035,6 +1091,13 @@ class GitHubAutomationService:
                             target = dest / fname
                             target.write_bytes(down.content)
                             extracted_any = True
+                # Record which files were extracted for diagnosis
+                logger = logging.getLogger("github_automation")
+                if extracted_any:
+                    files = [p.name for p in dest.iterdir() if p.is_file()]
+                    logger.debug("EXTRACTED: run_id=%s files=%s", run_id, files)
+                else:
+                    logger.debug("NO_EXPECTED_FILES_IN_ARTIFACT: run_id=%s artifact_name=%s", run_id, art.get("name"))
 
                 if extracted_any:
                     return True
