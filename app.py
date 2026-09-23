@@ -965,7 +965,7 @@ def _refresh_repository_snapshot(automation: Any, repository: str) -> Any:
     )
     # Attempt to fetch prediction history when authenticated and repository connected
     runtime_token = _github_runtime_token()
-    if runtime_token and status.get("connected") and status.get("authenticated"):
+    if runtime_token and status_payload.get("connected") and status_payload.get("authenticated"):
         try:
             _attempt_download_model_from_actions(repository, runtime_token)
         except Exception:
