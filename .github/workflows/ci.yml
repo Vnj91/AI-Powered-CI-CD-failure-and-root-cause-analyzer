@@ -186,7 +186,7 @@ jobs:
           pip install ruff
 
       - name: Run ruff
-        run: ruff check .
+        run: ruff check . --exclude .venv311
 
       - name: Syntax check (compileall)
         run: python -m compileall -q .
