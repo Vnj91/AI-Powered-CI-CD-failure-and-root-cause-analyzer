@@ -43,6 +43,8 @@ class ErrorCategory(str, Enum):
     TIMEOUT = "timeout"                 # Timeout errors
     UNKNOWN = "unknown"                 # Cannot classify
 
+    LINT = "lint"                     # Lint/static analysis failures
+
 # PYDANTIC MODELS (Structured Output)
 
 class StackFrame(BaseModel):
@@ -334,6 +336,10 @@ def classify_error(error_type: str, error_message: str) -> ErrorCategory:
     if any(x in error_type_lower for x in ['syntax', 'indentation']):
         return ErrorCategory.SYNTAX
     
+    # Lint / static analysis failures (e.g., ruff, flake8)
+    if any(hint in message_lower for hint in ('ruff', 'flake8', 'pylint', 'lint', 'found errors', 'fixable with the `--fix`')):
+        return ErrorCategory.LINT
+
     # Test failures
     if 'assertion' in error_type_lower:
         return ErrorCategory.TEST_FAILURE
@@ -615,13 +621,16 @@ class LogParser:
         # unknown because an exit code alone cannot establish a root cause.
         if not errors and exit_code is not None and exit_code != 0:
             error_position = exit_code_match.start() if exit_code_match else len(cleaned_content)
+            raw_block = self._extract_error_block(cleaned_content, error_position)
+            # Use surrounding raw block to help classify exit-code-only failures
+            inferred_category = classify_error("ProcessExitError", raw_block)
             errors.append(ParsedError(
                 error_type="ProcessExitError",
                 error_message=f"Process completed with exit code {exit_code}",
-                error_category=ErrorCategory.UNKNOWN,
+                error_category=inferred_category,
                 failed_step=self._find_failed_step(cleaned_content, error_position),
                 exit_code=exit_code,
-                raw_error_block=self._extract_error_block(cleaned_content, error_position),
+                raw_error_block=raw_block,
             ))
         
         # STEP 8: Create result

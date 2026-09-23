@@ -692,17 +692,55 @@ class GitHubAutomationService:
                         continue
                     file_size = int(info.file_size)
                     if total_uncompressed + file_size > max_bytes:
-                        # Gracefully truncate this file's content to fit remaining budget
-                        remaining = max_bytes - total_uncompressed
+                        # Gracefully truncate this file's content to fit remaining budget.
+                        # Preserve both the head and tail of the file so that final
+                        # summaries (common in linters, compilers, and test runners)
+                        # remain available to the deterministic parser.
+                        # Reserve some bytes for the TRUNCATED_NOTICE and marker
+                        reserved_notice = 512
+                        remaining = max_bytes - total_uncompressed - reserved_notice
                         if remaining <= 0:
                             truncated = True
                             break
+                        # Strategy: keep the first N_head bytes and last N_tail bytes
+                        # where N_head + N_tail == remaining (allowing a small gap marker)
+                        # Prefer keeping slightly more head when remaining is small.
+                        # Ensure we read valid UTF-8 by slicing bytes and decoding with replace.
                         try:
                             with archive.open(info) as fh:
-                                part = fh.read(remaining)
+                                # If the file is smaller than remaining, read all
+                                if file_size <= remaining:
+                                    part = fh.read()
+                                    content = part.decode("utf-8", errors="replace")
+                                else:
+                                    # Compute head/tail split
+                                    # Reserve 64 bytes for an ellipsis marker when possible
+                                    reserve_marker = 64 if remaining > 128 else 0
+                                    usable = max(1, remaining - reserve_marker)
+                                    n_head = max(1, usable // 2 + usable % 2)
+                                    n_tail = max(0, usable - n_head)
+
+                                    # Read head
+                                    fh.seek(0)
+                                    head_bytes = fh.read(n_head)
+
+                                    # Read tail by seeking near the end
+                                    if n_tail > 0:
+                                        try:
+                                            fh.seek(max(0, file_size - n_tail))
+                                        except Exception:
+                                            # Fallback: read whole and slice
+                                            fh.seek(0)
+                                        tail_bytes = fh.read(n_tail)
+                                    else:
+                                        tail_bytes = b""
+
+                                    # Construct content with marker between head and tail
+                                    marker = b"\n...[TRUNCATED]...\n" if reserve_marker else b"\n"
+                                    part = head_bytes + marker + tail_bytes
+                                    content = part.decode("utf-8", errors="replace")
                         except Exception:
-                            part = b""
-                        content = part.decode("utf-8", errors="replace")
+                            content = ""
                         redacted = redact_sensitive_text(content)
                         log_files.append(
                             GitHubWorkflowLogFile(
@@ -711,7 +749,7 @@ class GitHubAutomationService:
                                 size_bytes=len(redacted.encode("utf-8")),
                             )
                         )
-                        total_uncompressed += len(part)
+                        total_uncompressed += len(redacted.encode("utf-8"))
                         truncated = True
                         break
                     total_uncompressed += file_size

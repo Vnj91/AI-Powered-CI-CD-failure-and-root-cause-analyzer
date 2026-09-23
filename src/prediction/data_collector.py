@@ -329,6 +329,17 @@ class HistoricalRunCollector:
         frame = pd.DataFrame(records)
         if not frame.empty:
             frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
+            # Ensure one row per workflow run id: when duplicate run_id values
+            # appear (e.g., due to repeated API reads or inconsistent repo
+            # behaviors), keep the most recent record by timestamp so the
+            # collector output is idempotent and deterministic.
+            if "run_id" in frame.columns:
+                frame = (
+                    frame.sort_values(["timestamp", "run_id"], kind="mergesort")
+                    .drop_duplicates(subset=["run_id"], keep="last")
+                    .sort_values("timestamp", kind="mergesort")
+                    .reset_index(drop=True)
+                )
         return frame
 
     def build_prediction_features(

@@ -218,9 +218,44 @@ def _load_csv(path: Path) -> pd.DataFrame:
 
 def _atomic_save_csv(frame: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # If an existing dataset is present, merge with it and remove any
+    # exact repeated workflow-run records by `run_id`. Keep the most
+    # recent record (by `timestamp`) for each `run_id` so syncs are
+    # idempotent and repeated collections do not create duplicates.
+    final = frame.copy()
+    try:
+        if path.exists():
+            try:
+                existing = pd.read_csv(path)
+                if not existing.empty and not final.empty:
+                    combined = pd.concat([existing, final], ignore_index=True)
+                elif not existing.empty:
+                    combined = existing.copy()
+                else:
+                    combined = final.copy()
+
+                # Prefer rows with the latest timestamp when duplicate run_id
+                if "run_id" in combined.columns and "timestamp" in combined.columns:
+                    combined["timestamp"] = pd.to_datetime(combined["timestamp"], errors="coerce")
+                    combined = (
+                        combined.sort_values(["timestamp", "run_id"], kind="mergesort")
+                        .drop_duplicates(subset=["run_id"], keep="last")
+                        .sort_values("timestamp", kind="mergesort")
+                        .reset_index(drop=True)
+                    )
+                else:
+                    combined = combined.drop_duplicates()
+
+                final = combined
+            except Exception:
+                # If reading the existing file fails, fall back to overwriting
+                final = frame.copy()
+    except Exception:
+        final = frame.copy()
+
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
-        frame.to_csv(temporary, index=False)
+        final.to_csv(temporary, index=False)
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
