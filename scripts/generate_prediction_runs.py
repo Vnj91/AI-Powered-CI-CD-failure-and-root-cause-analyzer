@@ -85,16 +85,50 @@ def _status_is_clean(status_lines: Sequence[str]) -> bool:
         return True
 
     remaining_paths: list[str] = []
+
     for raw_line in status_lines:
         line = raw_line.strip()
         if not line:
             continue
+
         if len(line) < 3:
-            return False
-        path = line[3:]
+            remaining_paths.append(line)
+            continue
+
+        path = line[3:].strip()
         normalized = _normalize_status_path(path)
-        if not normalized or not _is_allowed_status_path(normalized):
-            remaining_paths.append(normalized or path)
+
+        if not normalized:
+            remaining_paths.append(path)
+            continue
+
+        if normalized == ".tools" or normalized.startswith(".tools/"):
+            continue
+
+        if normalized in ALLOWED_PATHS:
+            continue
+
+        if normalized == "data":
+            data_dir = PROJECT_ROOT / "data"
+            allowed_data = {
+                "generated_run_plan.json",
+                "generated_runs.json",
+                "historical_runs.csv",
+                "prediction_history.csv",
+                "prediction_run_marker.txt",
+            }
+
+            if data_dir.is_dir():
+                actual_files = {
+                    str(p.relative_to(data_dir)).replace("\\", "/")
+                    for p in data_dir.rglob("*")
+                    if p.is_file()
+                }
+
+                if actual_files <= allowed_data:
+                    continue
+
+        remaining_paths.append(normalized)
 
     return not remaining_paths
 
