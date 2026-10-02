@@ -329,45 +329,73 @@ def _wait_for_feedback_workflow(run_id: int, *, poll_interval: int = 15, timeout
 
 def _run_ci_and_wait(commit_sha: str, *, poll_interval: int, timeout_seconds: int) -> tuple[int, dict[str, str]]:
     repo = _repo_name()
-    result = _run_command(["gh", "run", "list", "--repo", repo, "--workflow", "CI/CD Pipeline", "--limit", "1", "--json", "databaseId"], check=False)
-    if result.returncode != 0:
-        raise RuntimeError("Unable to query GitHub CI runs.")
 
     # Trigger the workflow by pushing the commit to the main branch.
     _run_command(["git", "push", "origin", "HEAD:main"], check=True)
 
-    run_list = _run_command([
-        "gh",
-        "run",
-        "list",
-        "--repo",
-        repo,
-        "--workflow",
-        "CI/CD Pipeline",
-        "--branch",
-        "main",
-        "--limit",
-        "5",
-        "--json",
-        "databaseId,headSha,status,conclusion",
-    ], check=True)
-    try:
-        runs = json.loads(run_list.stdout) if run_list.stdout.strip() else []
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Failed to parse GitHub run list response.") from exc
+    # GitHub Actions may take some time to register the workflow run.
+    # Keep checking for up to 15 minutes instead of failing immediately.
+    deadline = time.monotonic() + 900
 
-    matching = [entry for entry in runs if str(entry.get("headSha", "")).startswith(commit_sha[:7])]
-    if not matching:
-        raise RuntimeError(f"No CI run found for commit {commit_sha[:12]}")
-
-    run_id = int(matching[0]["databaseId"])
-    state = _wait_for_ci_run(run_id, poll_interval=poll_interval, timeout_seconds=timeout_seconds)
-    if str(state.get("conclusion", "")).lower() not in {"success", "neutral", "skipped"}:
-        raise RuntimeError(
-            f"CI run {run_id} concluded as '{state.get('conclusion')}' instead of success. "
-            "Stopping immediately."
+    while time.monotonic() < deadline:
+        run_list = _run_command(
+            [
+                "gh",
+                "run",
+                "list",
+                "--repo",
+                repo,
+                "--workflow",
+                "CI/CD Pipeline",
+                "--branch",
+                "main",
+                "--limit",
+                "10",
+                "--json",
+                "databaseId,headSha,status,conclusion",
+            ],
+            check=True,
         )
-    return run_id, state
+
+        try:
+            runs = json.loads(run_list.stdout) if run_list.stdout.strip() else []
+        except json.JSONDecodeError:
+            runs = []
+
+        matching = [
+            entry
+            for entry in runs
+            if str(entry.get("headSha", "")).startswith(commit_sha[:7])
+        ]
+
+        if matching:
+            run_id = int(matching[0]["databaseId"])
+
+            state = _wait_for_ci_run(
+                run_id,
+                poll_interval=poll_interval,
+                timeout_seconds=timeout_seconds,
+            )
+
+            if str(state.get("conclusion", "")).lower() not in {
+                "success",
+                "neutral",
+                "skipped",
+            }:
+                raise RuntimeError(
+                    f"CI run {run_id} concluded as "
+                    f"'{state.get('conclusion')}' instead of success. "
+                    "Stopping immediately."
+                )
+
+            return run_id, state
+
+        print("- CI run not visible yet; checking again in 15s...")
+        time.sleep(15)
+
+    raise TimeoutError(
+        f"No CI run appeared for commit {commit_sha[:12]} within 15 minutes."
+    )
 
 
 def _create_prediction_commit(counter: int, *, dry_run: bool) -> str:
