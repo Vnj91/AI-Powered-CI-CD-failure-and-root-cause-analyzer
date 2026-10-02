@@ -84,7 +84,13 @@ def _status_is_clean(status_lines: Sequence[str]) -> bool:
     if not status_lines:
         return True
 
-    remaining_paths: list[str] = []
+    allowed_data = {
+        "generated_run_plan.json",
+        "generated_runs.json",
+        "historical_runs.csv",
+        "prediction_history.csv",
+        "prediction_run_marker.txt",
+    }
 
     for raw_line in status_lines:
         line = raw_line.strip()
@@ -92,58 +98,43 @@ def _status_is_clean(status_lines: Sequence[str]) -> bool:
             continue
 
         if len(line) < 3:
-            remaining_paths.append(line)
-            continue
+            return False
 
-        raw_path = line[3:].strip()
+        path = _normalize_status_path(line[3:].strip())
 
-        if raw_path == "data/prediction_run_marker.txt":
-            continue
+        if path == "data":
+            data_dir = PROJECT_ROOT / "data"
+            if not data_dir.is_dir():
+                return False
 
-        path = _normalize_status_path(raw_path)
-        if not path:
-            remaining_paths.append(line)
-            continue
+            actual_files = {
+                str(f.relative_to(data_dir)).replace("\\", "/")
+                for f in data_dir.rglob("*")
+                if f.is_file()
+            }
+
+            if actual_files <= allowed_data:
+                continue
+
+            return False
+
+        if path.startswith("data/"):
+            if path.removeprefix("data/") in allowed_data:
+                continue
+            return False
 
         if path == ".tools" or path.startswith(".tools/"):
+            continue
+
+        if path in {"report.md", "reportdata.md"}:
             continue
 
         if path in ALLOWED_PATHS:
             continue
 
-        if path == "data" or path.startswith("data/"):
-            if path == "data":
-                continue
-            rel = path.removeprefix("data/")
-            allowed_data = {
-                "generated_run_plan.json",
-                "generated_runs.json",
-                "historical_runs.csv",
-                "prediction_history.csv",
-                "prediction_run_marker.txt",
-            }
+        return False
 
-            if rel in allowed_data:
-                continue
-
-            if path == "data":
-                data_dir = PROJECT_ROOT / "data"
-                if data_dir.is_dir():
-                    actual_files = {
-                        str(p.relative_to(data_dir)).replace("\\", "/")
-                        for p in data_dir.rglob("*")
-                        if p.is_file()
-                    }
-                    if actual_files <= allowed_data:
-                        continue
-
-        if path == "report.md" or path == "reportdata.md":
-            continue
-
-        remaining_paths.append(path)
-
-    return not remaining_paths
-
+    return True
 
 def _ensure_git_available() -> None:
     try:
