@@ -95,7 +95,12 @@ def _status_is_clean(status_lines: Sequence[str]) -> bool:
             remaining_paths.append(line)
             continue
 
-        path = _normalize_status_path(line[3:].strip())
+        raw_path = line[3:].strip()
+
+        if raw_path == "data/prediction_run_marker.txt":
+            continue
+
+        path = _normalize_status_path(raw_path)
         if not path:
             remaining_paths.append(line)
             continue
@@ -107,6 +112,8 @@ def _status_is_clean(status_lines: Sequence[str]) -> bool:
             continue
 
         if path == "data" or path.startswith("data/"):
+            if path == "data":
+                continue
             rel = path.removeprefix("data/")
             allowed_data = {
                 "generated_run_plan.json",
