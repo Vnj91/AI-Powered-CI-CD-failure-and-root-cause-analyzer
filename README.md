@@ -247,6 +247,27 @@ Safety limits:
 - `--execute` is required for generation, collection, and training.
 - Polling defaults to 10 seconds with a 900-second per-workflow timeout; completed metadata is persisted after each run for safe resume.
 
+## Generating Real Prediction Records Through CI
+
+Use the dedicated script when you want to create a short sequence of real GitHub Actions runs that naturally trigger the existing prediction and feedback pipeline without fabricating CSV rows.
+
+```bash
+python3 scripts/generate_prediction_runs.py --runs 5
+python3 scripts/generate_prediction_runs.py --runs 10 --interval 30
+```
+
+The script:
+
+- checks that the repository is clean before starting;
+- refuses to run if unrelated files or modifications are present;
+- keeps changes limited to a dedicated marker file in `data/prediction_run_marker.txt`;
+- creates a harmless commit on the main branch for each run;
+- waits for the `CI/CD Pipeline` run to finish successfully;
+- waits for the `Prediction Feedback` workflow to complete before continuing;
+- prints concise progress about each commit, CI run, and prediction-history record count.
+
+This is for generating genuine prediction observations for development and testing of the existing pipeline, not for synthetic training or fake dataset entries.
+
 ## Building a Real Historical CI Dataset
 
 This project learns from **genuine GitHub Actions workflow runs**. Do not fabricate CSV rows or synthetic labels.
