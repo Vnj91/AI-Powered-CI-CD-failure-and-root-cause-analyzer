@@ -27,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 MARKER_PATH = PROJECT_ROOT / "data" / "prediction_run_marker.txt"
 DEFAULT_REPO = "Vnj91/AI-Powered-CI-CD-failure-and-root-cause-analyzer"
+IGNORED_WORKTREE_PATHS = {".tools/", "report.md", "reportdata.md", "data/prediction_run_marker.txt"}
 
 
 def _run_command(args: Sequence[str], *, check: bool = True, capture: bool = True, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -67,7 +68,7 @@ def _status_is_clean(status_lines: Sequence[str]) -> bool:
             normalized = target.strip()
         else:
             return False
-        if normalized not in {"data/prediction_run_marker.txt"}:
+        if normalized not in IGNORED_WORKTREE_PATHS:
             return False
     return True
 
