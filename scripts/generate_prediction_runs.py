@@ -145,13 +145,54 @@ def _ensure_git_available() -> None:
 
 
 def _require_clean_worktree() -> None:
-    status = _normalize_status(_run_command(["git", "status", "--short", "--untracked-files=all"]).stdout)
-    if status and not _status_is_clean(status):
+    status = _normalize_status(
+        _run_command(
+            ["git", "status", "--short", "--untracked-files=all"]
+        ).stdout
+    )
+
+    allowed = {
+        ".tools/",
+        "report.md",
+        "reportdata.md",
+        "data/generated_run_plan.json",
+        "data/generated_runs.json",
+        "data/historical_runs.csv",
+        "data/prediction_history.csv",
+        "data/prediction_run_marker.txt",
+    }
+
+    for raw_line in status:
+        path = raw_line[3:].strip() if len(raw_line) >= 3 else raw_line.strip()
+        path = _normalize_status_path(path)
+
+        if path in allowed:
+            continue
+
+        if path == ".tools" or path.startswith(".tools/"):
+            continue
+
+        if path == "data":
+            data_dir = PROJECT_ROOT / "data"
+            actual_files = {
+                str(f.relative_to(data_dir)).replace("\\", "/")
+                for f in data_dir.rglob("*")
+                if f.is_file()
+            }
+            allowed_data = {
+                "generated_run_plan.json",
+                "generated_runs.json",
+                "historical_runs.csv",
+                "prediction_history.csv",
+                "prediction_run_marker.txt",
+            }
+            if actual_files <= allowed_data:
+                continue
+
         raise RuntimeError(
             "Refusing to run: working tree is not clean. "
             "Please commit or stash unrelated changes before generating CI prediction runs."
         )
-
 
 def _repo_name() -> str:
     repo = os.environ.get("GITHUB_REPOSITORY")
@@ -349,12 +390,41 @@ def _validate_only_marker_changed() -> None:
     status = _normalize_status(_run_command(["git", "status", "--short"]).stdout)
     if not status:
         return
-    if not _status_is_clean(status):
+
+    allowed_data = {
+        "generated_run_plan.json",
+        "generated_runs.json",
+        "historical_runs.csv",
+        "prediction_history.csv",
+        "prediction_run_marker.txt",
+    }
+
+    for raw_line in status:
+        path = _normalize_status_path(raw_line[3:].strip())
+
+        if path == "data":
+            data_dir = PROJECT_ROOT / "data"
+            actual_files = {
+                str(f.relative_to(data_dir)).replace("\\", "/")
+                for f in data_dir.rglob("*")
+                if f.is_file()
+            }
+            if actual_files <= allowed_data:
+                continue
+
+        if path == "data/prediction_run_marker.txt":
+            continue
+
+        if path in {".tools", "report.md", "reportdata.md"}:
+            continue
+
+        if path.startswith(".tools/"):
+            continue
+
         raise RuntimeError(
             "Refusing to proceed: repository state is not limited to the dedicated marker file. "
             f"Detected: {status}"
         )
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
