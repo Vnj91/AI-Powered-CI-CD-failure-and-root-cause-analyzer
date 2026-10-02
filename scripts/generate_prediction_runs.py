@@ -95,21 +95,19 @@ def _status_is_clean(status_lines: Sequence[str]) -> bool:
             remaining_paths.append(line)
             continue
 
-        path = line[3:].strip()
-        normalized = _normalize_status_path(path)
-
-        if not normalized:
-            remaining_paths.append(path)
+        path = _normalize_status_path(line[3:].strip())
+        if not path:
+            remaining_paths.append(line)
             continue
 
-        if normalized == ".tools" or normalized.startswith(".tools/"):
+        if path == ".tools" or path.startswith(".tools/"):
             continue
 
-        if normalized in ALLOWED_PATHS:
+        if path in ALLOWED_PATHS:
             continue
 
-        if normalized == "data":
-            data_dir = PROJECT_ROOT / "data"
+        if path == "data" or path.startswith("data/"):
+            rel = path.removeprefix("data/")
             allowed_data = {
                 "generated_run_plan.json",
                 "generated_runs.json",
@@ -118,17 +116,24 @@ def _status_is_clean(status_lines: Sequence[str]) -> bool:
                 "prediction_run_marker.txt",
             }
 
-            if data_dir.is_dir():
-                actual_files = {
-                    str(p.relative_to(data_dir)).replace("\\", "/")
-                    for p in data_dir.rglob("*")
-                    if p.is_file()
-                }
+            if rel in allowed_data:
+                continue
 
-                if actual_files <= allowed_data:
-                    continue
+            if path == "data":
+                data_dir = PROJECT_ROOT / "data"
+                if data_dir.is_dir():
+                    actual_files = {
+                        str(p.relative_to(data_dir)).replace("\\", "/")
+                        for p in data_dir.rglob("*")
+                        if p.is_file()
+                    }
+                    if actual_files <= allowed_data:
+                        continue
 
-        remaining_paths.append(normalized)
+        if path == "report.md" or path == "reportdata.md":
+            continue
+
+        remaining_paths.append(path)
 
     return not remaining_paths
 
