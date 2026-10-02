@@ -27,7 +27,16 @@ if str(PROJECT_ROOT) not in sys.path:
 
 MARKER_PATH = PROJECT_ROOT / "data" / "prediction_run_marker.txt"
 DEFAULT_REPO = "Vnj91/AI-Powered-CI-CD-failure-and-root-cause-analyzer"
-IGNORED_WORKTREE_PATHS = {".tools/", "report.md", "reportdata.md", "data/", "data/prediction_run_marker.txt"}
+ALLOWED_PATHS = {
+    ".tools/",
+    "report.md",
+    "reportdata.md",
+    "data/generated_run_plan.json",
+    "data/generated_runs.json",
+    "data/historical_runs.csv",
+    "data/prediction_history.csv",
+    "data/prediction_run_marker.txt",
+}
 
 
 def _run_command(args: Sequence[str], *, check: bool = True, capture: bool = True, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -51,37 +60,43 @@ def _normalize_status(raw: str) -> list[str]:
     return [line.strip() for line in raw.splitlines() if line.strip()]
 
 
+def _normalize_status_path(path: str) -> str:
+    normalized = path.strip().replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    while normalized.startswith("/"):
+        normalized = normalized[1:]
+    return normalized
+
+
+def _is_allowed_status_path(path: str) -> bool:
+    normalized = _normalize_status_path(path)
+    if not normalized:
+        return False
+    if normalized in ALLOWED_PATHS:
+        return True
+    if normalized == ".tools" or normalized.startswith(".tools/"):
+        return True
+    return False
+
+
 def _status_is_clean(status_lines: Sequence[str]) -> bool:
     if not status_lines:
         return True
 
+    remaining_paths: list[str] = []
     for raw_line in status_lines:
         line = raw_line.strip()
         if not line:
             continue
-        parts = line.split(None, 1)
-        if len(parts) != 2:
+        if len(line) < 3:
             return False
-        status_code, target = parts
-        normalized = target.strip()
-        if status_code not in {"??", "M", "A", "D"}:
-            return False
+        path = line[3:]
+        normalized = _normalize_status_path(path)
+        if not normalized or not _is_allowed_status_path(normalized):
+            remaining_paths.append(normalized or path)
 
-        if normalized == "data/":
-            data_dir = PROJECT_ROOT / "data"
-            if not data_dir.exists() or not data_dir.is_dir():
-                return False
-            entries = {entry.name for entry in data_dir.iterdir()}
-            if entries - {"prediction_run_marker.txt"}:
-                return False
-            continue
-
-        if normalized in IGNORED_WORKTREE_PATHS:
-            continue
-
-        return False
-
-    return True
+    return not remaining_paths
 
 
 def _ensure_git_available() -> None:
@@ -93,7 +108,7 @@ def _ensure_git_available() -> None:
 
 
 def _require_clean_worktree() -> None:
-    status = _normalize_status(_run_command(["git", "status", "--short"]).stdout)
+    status = _normalize_status(_run_command(["git", "status", "--short", "--untracked-files=all"]).stdout)
     if status and not _status_is_clean(status):
         raise RuntimeError(
             "Refusing to run: working tree is not clean. "
@@ -136,7 +151,7 @@ def _ensure_marker_file_exists() -> None:
 
 
 def _verify_marker_only_change() -> None:
-    status = _normalize_status(_run_command(["git", "status", "--short"]).stdout)
+    status = _normalize_status(_run_command(["git", "status", "--short", "--untracked-files=all"]).stdout)
     if not status:
         return
     if not _status_is_clean(status):
