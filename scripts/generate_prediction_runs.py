@@ -27,7 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 MARKER_PATH = PROJECT_ROOT / "data" / "prediction_run_marker.txt"
 DEFAULT_REPO = "Vnj91/AI-Powered-CI-CD-failure-and-root-cause-analyzer"
-IGNORED_WORKTREE_PATHS = {".tools/", "report.md", "reportdata.md", "data/prediction_run_marker.txt"}
+IGNORED_WORKTREE_PATHS = {".tools/", "report.md", "reportdata.md", "data/", "data/prediction_run_marker.txt"}
 
 
 def _run_command(args: Sequence[str], *, check: bool = True, capture: bool = True, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -54,6 +54,7 @@ def _normalize_status(raw: str) -> list[str]:
 def _status_is_clean(status_lines: Sequence[str]) -> bool:
     if not status_lines:
         return True
+
     for raw_line in status_lines:
         line = raw_line.strip()
         if not line:
@@ -62,14 +63,24 @@ def _status_is_clean(status_lines: Sequence[str]) -> bool:
         if len(parts) != 2:
             return False
         status_code, target = parts
-        if status_code == "??":
-            normalized = target.strip()
-        elif status_code in {"M", "A", "D"}:
-            normalized = target.strip()
-        else:
+        normalized = target.strip()
+        if status_code not in {"??", "M", "A", "D"}:
             return False
-        if normalized not in IGNORED_WORKTREE_PATHS:
-            return False
+
+        if normalized == "data/":
+            data_dir = PROJECT_ROOT / "data"
+            if not data_dir.exists() or not data_dir.is_dir():
+                return False
+            entries = {entry.name for entry in data_dir.iterdir()}
+            if entries - {"prediction_run_marker.txt"}:
+                return False
+            continue
+
+        if normalized in IGNORED_WORKTREE_PATHS:
+            continue
+
+        return False
+
     return True
 
 
