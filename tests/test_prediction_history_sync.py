@@ -1,5 +1,7 @@
 import io
 import zipfile
+from pathlib import Path
+
 import pandas as pd
 from src.integrations.github_automation import GitHubAutomationService
 from src.prediction.history_store import save_prediction_history, load_prediction_history
@@ -51,3 +53,46 @@ def test_prediction_history_download_and_merge(tmp_path, monkeypatch):
     assert 'c' in set(merged['prediction_id'])
     # b must be updated to 0.9 from downloaded
     assert float(merged[merged['prediction_id']=='b']['failure_probability'].iloc[0]) == 0.9
+
+
+def test_download_latest_prediction_history_accepts_uploaded_member_path(tmp_path, monkeypatch):
+    downloaded = pd.DataFrame([
+        {'prediction_id': 'new', 'failure_probability': 0.75},
+    ])
+    csv_bytes = downloaded.to_csv(index=False).encode('utf-8')
+
+    class FakeResponse:
+        def __init__(self, payload=None, content=b'', status_code=200):
+            self._payload = payload or {}
+            self.content = content
+            self.status_code = status_code
+            self.headers = {}
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            return None
+
+    def fake_get(self, url, timeout=30, stream=False, **kwargs):
+        if url.endswith('/actions/runs?status=success&per_page=40'):
+            return FakeResponse({'workflow_runs': [{'id': 123}]})
+        if url.endswith('/actions/runs/123/artifacts'):
+            return FakeResponse({'artifacts': [{'name': 'prediction-history', 'archive_download_url': 'https://example.invalid/artifact.zip'}]})
+        if url == 'https://example.invalid/artifact.zip':
+            bio = io.BytesIO()
+            with zipfile.ZipFile(bio, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr('prediction-history-artifact/prediction_history.csv', csv_bytes)
+            return FakeResponse(content=bio.getvalue(), status_code=200)
+        raise AssertionError(f'unexpected URL: {url}')
+
+    monkeypatch.setattr('requests.Session.get', fake_get)
+
+    service = GitHubAutomationService(token='token', repository='owner/repo')
+    dest = tmp_path / 'downloaded_history.csv'
+
+    assert service.download_latest_prediction_history('owner/repo', dest) is True
+    assert dest.exists()
+    loaded = pd.read_csv(dest)
+    assert loaded['prediction_id'].tolist() == ['new']
+    assert float(loaded['failure_probability'].iloc[0]) == 0.75

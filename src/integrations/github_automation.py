@@ -1211,10 +1211,15 @@ class GitHubAutomationService:
 
                 try:
                     with zipfile.ZipFile(io.BytesIO(down.content)) as archive:
+                        expected_basename = Path(expected_member).name
                         for info in archive.infolist():
-                            # match path endswith expected_member
-                            if str(info.filename).endswith(expected_member):
-                                # write to dest path (overwrite into a temp file)
+                            member_name = str(info.filename).replace('\\', '/')
+                            normalized = member_name.lstrip('./')
+                            if (
+                                normalized == expected_member
+                                or normalized.endswith('/' + expected_member)
+                                or Path(normalized).name == expected_basename
+                            ):
                                 with archive.open(info) as source:
                                     data = source.read()
                                 dest.write_bytes(data)
